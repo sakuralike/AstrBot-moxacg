@@ -363,6 +363,113 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("用法", text)
         self.assertEqual(len(self.requests), before)
 
+    async def test_search_covers_keep_article_order_when_downloads_finish_out_of_order(self):
+        second_done = asyncio.Event()
+
+        async def download(url, settings):
+            self.assertIs(settings, self.settings)
+            if url.endswith("/first.png"):
+                await second_done.wait()
+                return b"first-image"
+            second_done.set()
+            return b"second-image"
+
+        items = [
+            {"title": title, "published_at": "2026-10-22", "url": self.base + f"/?p={index}",
+             "cover_url": self.base + f"/{title}.png"}
+            for index, title in enumerate(("first", "second"), 1)
+        ]
+        with patch("astrbot_plugin_zibll.service.fetch_avatar", side_effect=download):
+            results = await asyncio.wait_for(self.run_command("/网站搜索 test", {"items": items}), 2)
+        self.assertIsInstance(results, list)
+        self.assertEqual(len(results), 2)
+        self.assertEqual([image for _, image in results], [b"first-image", b"second-image"])
+        for index, (text, _) in enumerate(results, 1):
+            self.assertIn(f"{index}. {items[index - 1]['title']}", text)
+            self.assertIn(items[index - 1]["url"], text)
+        self.assertTrue(results[0][0].startswith("文章搜索结果\n"))
+
+    async def test_search_without_usable_covers_keeps_text(self):
+        for cover in ("", None, [], "http://169.254.169.254/latest", "https://other.example.com/cover.png"):
+            with self.subTest(cover=cover):
+                text, image = await self.run_command("/网站搜索 test", {"items": [{
+                    "title": "Article", "published_at": "2026-10-22", "url": self.base + "/?p=1",
+                    "cover_url": cover,
+                }]})
+                self.assertIn("1. Article", text)
+                self.assertIn(self.base + "/?p=1", text)
+                self.assertIsNone(image)
+        self.assertEqual(len(self.requests), 5)
+
+    async def test_latest_does_not_download_covers(self):
+        with patch("astrbot_plugin_zibll.service.fetch_avatar", new_callable=AsyncMock) as download:
+            text, image = await self.run_command("/网站最新", {"items": [{
+                "title": "Article", "published_at": "2026-10-22", "url": self.base + "/?p=1",
+                "cover_url": self.base + "/cover.png",
+            }]})
+        download.assert_not_awaited()
+        self.assertTrue(text.startswith("最新文章\n1. Article"))
+        self.assertIsNone(image)
+
+    async def test_search_validates_all_articles_before_downloading_covers(self):
+        with patch("astrbot_plugin_zibll.service.fetch_avatar", new_callable=AsyncMock) as download:
+            with self.assertRaises(BridgeError):
+                await self.run_command("/网站搜索 test", {"items": [
+                    {"title": "First", "published_at": "2026-10-22", "url": self.base + "/?p=1",
+                     "cover_url": self.base + "/cover.png"},
+                    {"title": "Second", "published_at": "2026-10-22", "url": "https://other.example.com/"},
+                ]})
+        download.assert_not_awaited()
+
+    async def test_group_handler_sends_search_covers_without_credentials_and_falls_back(self):
+        image = (Path(__file__).resolve().parents[1] / "logo.png").read_bytes()
+        self.payload = {"code": "ok", "data": {"items": [
+            {"title": "First", "published_at": "2026-10-22", "url": self.base + "/?p=1",
+             "cover_url": self.base + "/cover.png"},
+            {"title": "Second", "published_at": "2026-10-22", "url": self.base + "/?p=2"},
+            {"title": "Third", "published_at": "2026-10-22", "url": self.base + "/?p=3",
+             "cover_url": self.base + "/redirect.png"},
+            {"title": "Fourth", "published_at": "2026-10-22", "url": self.base + "/?p=4",
+             "cover_url": self.base + "/invalid.png"},
+        ]}}
+
+        def reply(request):
+            if request.path == "/cover.png":
+                return web.Response(body=image, content_type="image/png")
+            if request.path == "/redirect.png":
+                return web.Response(status=302, headers={"Location": "http://169.254.169.254/latest"})
+            if request.path == "/invalid.png":
+                return web.Response(body=b"not an image", content_type="image/png")
+            return web.json_response(self.payload)
+
+        self.reply = reply
+        module = load_main_with_framework_stubs()
+        plugin = module.ZibllPlugin(object(), config())
+        plugin.client = self.client
+        plugin.settings = self.settings
+        module.ScopedCommandFilter.settings = self.settings
+        plugin.connected = True
+        event = StubEvent("/网站搜索 test")
+        results = [result async for result in plugin.website_command(event)]
+        self.assertEqual(len(results), 4)
+        self.assertEqual(results[0].components[0], image)
+        self.assertIsNone(results[0].use_markdown_)
+        self.assertTrue(all(result.use_markdown_ is False for result in results[1:]))
+        texts = [results[0].components[1].text, *(result.text for result in results[1:])]
+        for index, text in enumerate(texts, 1):
+            self.assertIn(self.base + f"/?p={index}", text)
+            self.assertIn(f"{index}. ", text)
+        self.assertTrue(all(result.stopped for result in results))
+        self.assertTrue(event.stopped)
+        self.assertFalse(event.llm)
+        self.assertEqual(len(self.requests), 4)
+        for request in self.requests[1:]:
+            self.assertEqual(request.method, "GET")
+            self.assertFalse(any(name.lower().startswith("x-az-") for name in request.headers))
+            self.assertNotIn("Cookie", request.headers)
+            self.assertNotIn("Authorization", request.headers)
+        await plugin.terminate()
+
     async def test_profile_text_and_avatar_failure_are_explicit(self):
         text, image = await self.run_command("/网站资料", {
             "nickname": "User", "uid": 123, "joined_days": 4, "level": None,
@@ -438,11 +545,13 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.stopped)
         self.assertFalse(event.llm)
         self.assertEqual(replies[0].components[0], image)
+        self.assertIsNone(replies[0].use_markdown_)
         text = replies[0].components[1].text
         for field in ("昵称：Member", "UID：123", "天数：7", "Lv.2", "积分：50", "4 篇", "5 条"):
             self.assertIn(field, text)
         duplicate = [reply async for reply in plugin.website_command(StubEvent())]
         self.assertIn("频繁", duplicate[0].text)
+        self.assertIs(duplicate[0].use_markdown_, False)
         await plugin.terminate()
 
 
@@ -482,10 +591,21 @@ class At:
         self.qq = qq
 
 
+class Reply:
+    def __init__(self, id):
+        self.id = id
+
+
 class StubResult:
     def __init__(self, text):
         self.text = text
+        self.chain = [Plain(text)] if text else []
         self.stopped = False
+        self.use_markdown_ = None
+
+    def use_markdown(self, use=True):
+        self.use_markdown_ = use
+        return self
 
     def stop_event(self):
         self.stopped = True
@@ -496,6 +616,8 @@ class StubEvent:
     def __init__(self, text="/网站资料"):
         self.messages = [Plain(text)]
         self.platform = "onebot-instance"
+        self.platform_name = "aiocqhttp"
+        self.result = None
         self.bot = "001"
         self.group = "group-1"
         self.sender = "user-1"
@@ -506,6 +628,12 @@ class StubEvent:
 
     def get_platform_id(self):
         return self.platform
+
+    def get_platform_name(self):
+        return self.platform_name
+
+    def get_result(self):
+        return self.result
 
     def get_self_id(self):
         return self.bot
@@ -525,6 +653,7 @@ class StubEvent:
     def chain_result(self, components):
         result = StubResult("")
         result.components = components
+        result.chain = components
         return result
 
     def stop_event(self):
@@ -556,6 +685,14 @@ def load_main_with_framework_stubs():
         cls(raise_error=True)
         return lambda handler: handler
 
+    decorating_handlers = []
+
+    def on_decorating_result():
+        def register(handler):
+            decorating_handlers.append(handler)
+            return handler
+        return register
+
     modules = {
         name: types.ModuleType(name) for name in (
             "astrbot", "astrbot.api", "astrbot.api.event",
@@ -567,11 +704,13 @@ def load_main_with_framework_stubs():
     modules["astrbot.api.event"].AstrMessageEvent = StubEvent
     modules["astrbot.api.event"].filter = types.SimpleNamespace(
         CustomFilter=CustomFilter, custom_filter=custom_filter,
+        on_decorating_result=on_decorating_result,
         EventMessageTypeFilter=EventMessageTypeFilter,
         EventMessageType=types.SimpleNamespace(GROUP_MESSAGE="group"),
     )
     modules["astrbot.api.message_components"].At = At
     modules["astrbot.api.message_components"].Plain = Plain
+    modules["astrbot.api.message_components"].Reply = Reply
     modules["astrbot.api.message_components"].Image = types.SimpleNamespace(fromBytes=lambda data: data)
     modules["astrbot.api.star"].Context = object
     modules["astrbot.api.star"].Star = Star
@@ -580,7 +719,79 @@ def load_main_with_framework_stubs():
     module = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, modules):
         spec.loader.exec_module(module)
+    module.decorating_handlers = decorating_handlers
     return module
+
+
+class ReplyCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.module = load_main_with_framework_stubs()
+        self.plugin = self.module.ZibllPlugin(object(), config())
+
+    async def decorate(self, event):
+        for handler in self.module.decorating_handlers:
+            await handler(self.plugin, event)
+
+    async def test_qq_chat_and_builtin_text_replies_disable_markdown(self):
+        for prompt in ("ordinary chat", "/sid", "/help"):
+            for markdown in (None, True, False):
+                with self.subTest(prompt=prompt, markdown=markdown):
+                    event = StubEvent(prompt)
+                    event.platform_name = "qq_official"
+                    event.result = StubResult("Bot reply")
+                    event.result.chain[:0] = [Reply("message-1"), At(event.sender)]
+                    event.result.use_markdown_ = markdown
+                    chain = list(event.result.chain)
+                    await self.decorate(event)
+                    self.assertIs(event.result.use_markdown_, False)
+                    self.assertEqual(event.result.chain, chain)
+                    self.assertFalse(event.stopped)
+                    self.assertFalse(event.result.stopped)
+                    self.assertIsNone(event.llm)
+
+    async def test_other_platforms_keep_markdown_choice(self):
+        for platform in ("aiocqhttp", "telegram"):
+            for markdown in (None, True, False):
+                with self.subTest(platform=platform, markdown=markdown):
+                    event = StubEvent()
+                    event.platform_name = platform
+                    event.result = StubResult("Bot reply")
+                    event.result.use_markdown_ = markdown
+                    await self.decorate(event)
+                    self.assertIs(event.result.use_markdown_, markdown)
+
+    async def test_media_and_empty_results_are_unchanged(self):
+        event = StubEvent()
+        event.platform_name = "qq_official"
+        await self.decorate(event)
+        self.assertIsNone(event.result)
+        for components in ([], [b"image"], [Plain("Caption"), b"image"], [object()]):
+            with self.subTest(components=components):
+                event.result = event.chain_result(components)
+                event.result.use_markdown_ = True
+                await self.decorate(event)
+                self.assertIs(event.result.use_markdown_, True)
+                self.assertEqual(event.result.chain, components)
+
+    async def test_compatibility_does_not_require_website_connection_or_scope(self):
+        self.plugin = self.module.ZibllPlugin(object(), {})
+        event = StubEvent("ordinary chat")
+        event.platform_name = "qq_official"
+        event.platform = "qq-instance"
+        event.group = "another-group"
+        event.result = StubResult("Bot reply")
+        await self.decorate(event)
+        self.assertIs(event.result.use_markdown_, False)
+        self.assertIsNone(self.plugin.client)
+        self.assertFalse(event.stopped)
+
+    async def test_terminated_plugin_does_not_change_replies(self):
+        await self.plugin.terminate()
+        event = StubEvent()
+        event.platform_name = "qq_official"
+        event.result = StubResult("Bot reply")
+        await self.decorate(event)
+        self.assertIsNone(event.result.use_markdown_)
 
 
 class FilterContractTests(unittest.IsolatedAsyncioTestCase):
@@ -645,6 +856,7 @@ class FilterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.llm)
         self.assertTrue(results[0].stopped)
         self.assertIn("尚未通过验证", results[0].text)
+        self.assertIs(results[0].use_markdown_, False)
         event = StubEvent("ordinary chat")
         self.assertEqual([result async for result in plugin.website_command(event)], [])
         self.assertFalse(event.stopped)
@@ -659,6 +871,7 @@ class FilterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(plugin.connected)
         results = [result async for result in plugin.website_command(StubEvent("/网站签到"))]
         self.assertIn("消息 ID", results[0].text)
+        self.assertIs(results[0].use_markdown_, False)
         self.assertEqual(plugin.client.mock_calls[0][0], "capabilities")
         self.assertEqual(len(plugin.client.mock_calls), 1)
         await plugin.terminate()

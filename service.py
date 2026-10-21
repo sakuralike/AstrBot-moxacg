@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import html
 import json
@@ -101,7 +102,9 @@ def event_identity(event, actor: Actor) -> dict:
     return {"request_id": hashlib.sha256(key.encode()).hexdigest(), "event_time": int(timestamp)}
 
 
-async def execute(client: BridgeClient, match: CommandMatch, actor: Actor, event) -> tuple[str, bytes | None]:
+async def execute(
+    client: BridgeClient, match: CommandMatch, actor: Actor, event,
+) -> tuple[str, bytes | None] | list[tuple[str, bytes | None]]:
     settings = client.settings
     commands = settings.router.commands
     payload = {"actor": asdict(actor)}
@@ -189,5 +192,21 @@ async def execute(client: BridgeClient, match: CommandMatch, actor: Actor, event
                 f"{safe_text(item.get('published_at'), 30)}\n"
                 f"{safe_link(item.get('url'), settings.public_site_url)}"
             )
+        if action == "search":
+            async def download_cover(item):
+                url = item.get("cover_url")
+                if not isinstance(url, str) or not url:
+                    return None
+                try:
+                    return await fetch_avatar(url, settings)
+                except BridgeError:
+                    return None
+
+            images = await asyncio.gather(*(download_cover(item) for item in items))
+            if any(image is not None for image in images):
+                return [
+                    ((lines[0] + "\n" if index == 0 else "") + lines[index + 1], image)
+                    for index, image in enumerate(images)
+                ]
         return "\n".join(lines), None
     raise BridgeError("invalid_parameters")

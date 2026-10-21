@@ -65,9 +65,9 @@
   },
   "avatar_hosts": {
     "type": "list",
-    "description": "额外允许的头像域名",
+    "description": "额外允许的头像及文章封面域名",
     "default": [],
-    "hint": "默认允许网站域名。头像使用 CDN 时添加精确域名，例如 cdn.example.com，不含协议或路径。"
+    "hint": "默认允许网站域名。头像或文章封面使用 CDN 时添加精确域名，例如 cdn.example.com，不含协议或路径。"
   },
   "commands": {
     "type": "object",

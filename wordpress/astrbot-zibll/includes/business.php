@@ -128,11 +128,33 @@ function articles($search, $input)
                 ) {
                     continue;
                 }
-                $items[] = array(
+                $item = array(
                     'title' => wp_strip_all_tags(html_entity_decode(get_the_title($post), ENT_QUOTES | ENT_HTML5, 'UTF-8')),
                     'published_at' => get_post_time('Y-m-d H:i', false, $post),
                     'url' => get_permalink($post),
                 );
+                if ($search) {
+                    $had_post = array_key_exists('post', $GLOBALS);
+                    $original_post = $GLOBALS['post'] ?? null;
+                    $GLOBALS['post'] = $post;
+                    try {
+                        $cover = function_exists('zib_post_thumbnail')
+                            ? zib_post_thumbnail('medium', '', true, $post)
+                            : get_the_post_thumbnail_url($post, 'medium');
+                    } finally {
+                        if ($had_post) {
+                            $GLOBALS['post'] = $original_post;
+                        } else {
+                            unset($GLOBALS['post']);
+                        }
+                    }
+                    if (is_string($cover) && str_starts_with($cover, '//')) {
+                        $cover = wp_parse_url(home_url('/'), PHP_URL_SCHEME) . ':' . $cover;
+                    }
+                    $item['cover_url'] = is_string($cover) && strlen($cover) <= 2048
+                        ? esc_url_raw($cover, array('https', 'http')) : '';
+                }
+                $items[] = $item;
                 if (count($items) >= $count) {
                     break;
                 }

@@ -224,13 +224,83 @@ foreach (array(
 clear_fixture_limits();
 $items = call_api('articles/search', $actor, array('keyword' => 'needle'))->get_data()['data']['items'];
 verify(count($items) === 1 && $items[0]['title'] === 'Public needle', 'Search only public unprotected titles, not body: ' . wp_json_encode($items));
-verify(array_keys($items[0]) === array('title', 'published_at', 'url'), 'Article response excludes content');
-verify(count(call_api('articles/latest', $actor)->get_data()['data']['items']) === 2, 'Latest excludes draft/private/password posts');
+verify(array_keys($items[0]) === array('title', 'published_at', 'url', 'cover_url'), 'Search returns cover URL but excludes content');
+verify($items[0]['cover_url'] === '', 'Article without an image has an empty cover URL');
+$latest = call_api('articles/latest', $actor)->get_data()['data']['items'];
+verify(count($latest) === 2, 'Latest excludes draft/private/password posts');
+verify(array_keys($latest[0]) === array('title', 'published_at', 'url'), 'Latest response remains unchanged');
 verify(call_api('articles/search', $actor, array('keyword' => ''))->get_status() === 400, 'Empty keyword rejected');
 $hidden = static fn($visible, $post) => $post->post_title !== 'Public needle';
 add_filter('astrbot_zibll_article_visible', $hidden, 10, 2);
 verify(call_api('articles/search', $actor, array('keyword' => 'needle'))->get_data()['data']['items'] === array(), 'Site visibility filter can exclude public metadata');
 remove_filter('astrbot_zibll_article_visible', $hidden);
+
+clear_fixture_limits();
+$isolated_upload_dir = static function ($dirs) {
+    $dirs['basedir'] = __DIR__ . '/uploads';
+    $dirs['path'] = $dirs['basedir'] . $dirs['subdir'];
+    return $dirs;
+};
+add_filter('upload_dir', $isolated_upload_dir);
+$empty_category = wp_insert_term('No cover', 'category')['term_id'];
+$cover_categories = array();
+foreach (array('one', 'two') as $name) {
+    $cover_categories[$name] = wp_insert_term('Cover category ' . $name, 'category')['term_id'];
+    zib_update_term_meta($cover_categories[$name], 'cover_image', 'https://cdn.example.com/category-' . $name . '.png');
+}
+$attachment = wp_insert_attachment(array(
+    'post_title' => 'Cover attachment', 'post_status' => 'inherit', 'post_mime_type' => 'image/jpeg',
+    'guid' => home_url('/wp-content/uploads/cover-fixture.jpg'),
+));
+update_post_meta($attachment, '_wp_attached_file', 'cover-fixture.jpg');
+update_post_meta($attachment, '_wp_attachment_metadata', array(
+    'width' => 800, 'height' => 600, 'file' => 'cover-fixture.jpg',
+    'sizes' => array('medium' => array(
+        'file' => 'cover-fixture-300x225.jpg', 'width' => 300, 'height' => 225, 'mime-type' => 'image/jpeg',
+    )),
+));
+$expected_covers = array(
+    'Featured' => wp_get_upload_dir()['baseurl'] . '/cover-fixture-300x225.jpg',
+    'External' => 'https://cdn.example.com/external.png',
+    'First' => 'https://cdn.example.com/first.png',
+    'Category one' => 'https://cdn.example.com/category-one.png',
+    'Category two' => 'https://cdn.example.com/category-two.png',
+    'Empty' => '',
+    'Invalid' => '',
+);
+$cover_posts = array();
+foreach ($expected_covers as $name => $expected) {
+    $cover_posts[$name] = wp_insert_post(array(
+        'post_title' => 'Cover fixture ' . $name, 'post_status' => 'publish', 'post_author' => $uid,
+        'post_content' => in_array($name, array('Featured', 'External', 'First'), true)
+            ? '<img src="https://cdn.example.com/first.png">' : '',
+        'post_category' => array($cover_categories[substr($name, 9)] ?? $empty_category),
+    ));
+}
+update_post_meta($cover_posts['Featured'], '_thumbnail_id', $attachment);
+zib_update_post_meta($cover_posts['Featured'], 'thumbnail_url', 'https://cdn.example.com/ignored.png');
+zib_update_post_meta($cover_posts['External'], 'thumbnail_url', '//cdn.example.com/external.png');
+zib_update_post_meta($cover_posts['Invalid'], 'thumbnail_url', 'javascript:alert(1)');
+$had_post = array_key_exists('post', $GLOBALS);
+$previous_post = $GLOBALS['post'] ?? null;
+$GLOBALS['post'] = get_post($cover_posts['Category one']);
+$original_post = $GLOBALS['post'];
+$original_user = get_current_user_id();
+$items = call_api('articles/search', $actor, array('keyword' => 'Cover fixture', 'count' => 10))->get_data()['data']['items'];
+verify(count($items) === count($expected_covers), 'Search includes every public cover fixture');
+foreach ($items as $item) {
+    $name = substr($item['title'], strlen('Cover fixture '));
+    verify($item['cover_url'] === $expected_covers[$name], 'Theme cover selection: ' . $name . ' ' . $item['cover_url']);
+}
+verify($GLOBALS['post'] === $original_post, 'Cover lookup restores the original global post');
+verify(get_current_user_id() === $original_user, 'Cover lookup restores the original current user');
+unset($GLOBALS['post']);
+call_api('articles/search', $actor, array('keyword' => 'Cover fixture', 'count' => 10));
+verify(!array_key_exists('post', $GLOBALS), 'Cover lookup preserves an unset global post');
+if ($had_post) {
+    $GLOBALS['post'] = $previous_post;
+}
+remove_filter('upload_dir', $isolated_upload_dir);
 
 clear_fixture_limits();
 $event = array('request_id' => hash('sha256', 'event-one'), 'event_time' => time());
