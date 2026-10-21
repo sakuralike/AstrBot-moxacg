@@ -1,0 +1,85 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用网站联动",
+    "default": false,
+    "hint": "先安装 WordPress 桥接并配置密钥和两端群白名单。保存后重载插件。"
+  },
+  "api_base_url": {
+    "type": "string",
+    "description": "桥接 API 基址",
+    "default": "https://moxacg.moe/wp-json/astrbot-zibll/v1",
+    "hint": "WordPress 桥接后台显示的 API 地址；站点需启用固定链接。"
+  },
+  "public_site_url": {
+    "type": "string",
+    "description": "用户可访问的网站地址",
+    "default": "https://moxacg.moe",
+    "hint": "必须与网站返回的 home 地址一致，可与 API 地址使用不同的主机。"
+  },
+  "client_id": {
+    "type": "string",
+    "description": "网站集成 client_id",
+    "default": ""
+  },
+  "key_id": {
+    "type": "string",
+    "description": "网站凭证 key_id",
+    "default": ""
+  },
+  "shared_secret": {
+    "type": "string",
+    "description": "网站生成的共享密钥",
+    "secret": true,
+    "default": ""
+  },
+  "allowed_groups": {
+    "type": "list",
+    "description": "允许的群范围",
+    "default": [],
+    "hint": "每项为 平台实例ID|机器人自身ID|群ID。空列表关闭全部群，不支持通配符。"
+  },
+  "allow_local_http": {
+    "type": "bool",
+    "description": "允许本机 HTTP 调试",
+    "default": false,
+    "hint": "仅允许 localhost、127.0.0.1 或 ::1 等环回地址，正式站点必须 HTTPS。"
+  },
+  "request_timeout": {
+    "type": "int",
+    "description": "请求总超时（秒）",
+    "default": 15,
+    "hint": "范围 3–30 秒，连接超时最多 3 秒；签到超时只查询状态，不自动重发写入。"
+  },
+  "latest_count": {
+    "type": "int",
+    "description": "最新文章条数",
+    "default": 5,
+    "hint": "1–10 条。"
+  },
+  "search_count": {
+    "type": "int",
+    "description": "搜索文章条数",
+    "default": 5,
+    "hint": "1–10 条；只匹配文章标题。"
+  },
+  "avatar_hosts": {
+    "type": "list",
+    "description": "额外允许的头像域名",
+    "default": [],
+    "hint": "默认允许网站域名。头像使用 CDN 时添加精确域名，例如 cdn.example.com，不含协议或路径。"
+  },
+  "commands": {
+    "type": "object",
+    "description": "群指令（修改后重载；仍需满足核心唤醒前缀或 @机器人）",
+    "items": {
+      "bind": {"type": "string", "description": "发起绑定", "default": "/网站绑定"},
+      "confirm": {"type": "string", "description": "绑定确认", "default": "/网站绑定确认"},
+      "unbind": {"type": "string", "description": "解绑", "default": "/网站解绑"},
+      "profile": {"type": "string", "description": "本人资料", "default": "/网站资料"},
+      "checkin": {"type": "string", "description": "网站签到", "default": "/网站签到"},
+      "latest": {"type": "string", "description": "最新文章", "default": "/网站最新"},
+      "search": {"type": "string", "description": "文章搜索", "default": "/网站搜索"}
+    }
+  }
+}
