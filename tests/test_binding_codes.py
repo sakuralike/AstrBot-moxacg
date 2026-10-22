@@ -130,6 +130,127 @@ class CodeFilterTests(unittest.IsolatedAsyncioTestCase):
     def pending(self):
         self.plugin.client.pending_bindings[self.actor] = ("a" * 64, time.monotonic() + 600)
 
+    async def use_qq_official(self, scopes=None):
+        await self.plugin.terminate()
+        self.plugin = self.module.ZibllPlugin(object(), {
+            **config(), "allowed_groups": scopes or ["qq-instance|qq_official|group-1"],
+        })
+        self.plugin.connected = True
+        self.plugin.client.binding_code_available = True
+        self.module.ScopedCommandFilter.code_ready = True
+        self.actor = Actor("qq-instance", "qq_official", "group-1", "user-1")
+
+    def qq_event(self, text="000001", message_id="code-1", bot="bot-openid"):
+        event = self.event(text, message_id)
+        event.platform_name = "qq_official"
+        event.platform = "qq-instance"
+        event.bot = bot
+        event.messages = [At(bot), Plain(text)]
+        return event
+
+    async def test_qq_official_bind_then_mentioned_code_uses_same_actor(self):
+        await self.use_qq_official()
+        self.plugin.client.request = AsyncMock(side_effect=[
+            {
+                "state": "pending",
+                "session_id": hashlib.sha256(("b" * 64).encode()).hexdigest(),
+                "expires_in": 600,
+                "url": "https://example.com/?az_bind=" + "b" * 64,
+            },
+            {"state": "bound", "uid": 1, "nickname": "Member"},
+        ])
+        start = self.qq_event("/网站绑定", "start-1", bot="qq_official")
+        start.messages = [Plain("/网站绑定")]
+        self.assertEqual(len([r async for r in self.plugin.website_command(start)]), 1)
+        self.plugin._cooldowns.clear()
+        code = self.qq_event()
+        self.assertTrue(self.module.ScopedCommandFilter().filter(code, {}))
+        results = [r async for r in self.plugin.website_command(code)]
+        self.assertEqual(len(results), 1)
+        self.assertIn("绑定成功", results[0].text)
+        self.assertTrue(code.stopped)
+        self.assertFalse(code.llm)
+        requests = self.plugin.client.request.await_args_list
+        self.assertEqual([call.args[0] for call in requests], [
+            "/binding/code/start", "/binding/code/redeem",
+        ])
+        self.assertEqual(requests[0].args[1]["actor"], requests[1].args[1]["actor"])
+        self.assertEqual(requests[1].args[1]["actor"]["bot_self_id"], "qq_official")
+        self.assertFalse(self.plugin.client.pending_bindings)
+        duplicate = self.qq_event()
+        duplicate.message_obj.timestamp = code.message_obj.timestamp
+        self.assertEqual([r async for r in self.plugin.website_command(duplicate)], [])
+        self.assertTrue(duplicate.stopped)
+        self.assertFalse(duplicate.llm)
+        self.assertEqual(self.plugin.client.request.await_count, 2)
+
+    async def test_qq_official_code_keeps_scope_and_sender_isolation(self):
+        await self.use_qq_official([
+            "qq-instance|qq_official|group-1", "qq-instance|qq_official|group-2",
+            "second-qq-instance|qq_official|group-1",
+        ])
+        self.pending()
+        self.plugin.client.request = AsyncMock()
+        for field, value in (
+            ("platform", "second-qq-instance"), ("platform", "unlisted-instance"),
+            ("group", "group-2"), ("group", "unlisted-group"), ("sender", "user-2"),
+            ("sender", "bot-openid"), ("sender", "qq_official"), ("bot", "other-bot"),
+            ("bot", None), ("platform_name", "aiocqhttp"), ("kind", "private"),
+        ):
+            with self.subTest(field=field, value=value):
+                event = self.qq_event()
+                setattr(event, field, value)
+                self.assertEqual([r async for r in self.plugin.website_command(event)], [])
+                self.assertFalse(event.stopped)
+                self.assertIsNone(event.llm)
+        for components in (
+            [Plain("000001")], [At("other"), Plain("000001")],
+            [At("qq_official"), Plain("000001")],
+            [At("bot-openid"), At("other"), Plain("000001")],
+            [At("bot-openid"), Reply("m"), Plain("000001")],
+        ):
+            event = self.qq_event()
+            event.messages = components
+            self.assertIsNone(self.module.ScopedCommandFilter.match(event))
+        self.plugin.client.request.assert_not_awaited()
+
+    async def test_qq_official_no_active_pending_leaves_numeric_chat_untouched(self):
+        await self.use_qq_official()
+        for deadline in (None, time.monotonic() - 1):
+            if deadline is not None:
+                self.plugin.client.pending_bindings[self.actor] = ("a" * 64, deadline)
+            event = self.qq_event()
+            self.assertEqual([r async for r in self.plugin.website_command(event)], [])
+            self.assertFalse(event.stopped)
+            self.assertIsNone(event.llm)
+
+    async def test_qq_official_explicit_bot_scope_is_not_widened(self):
+        await self.use_qq_official(["qq-instance|bot-openid|group-1"])
+        actor = Actor("qq-instance", "bot-openid", "group-1", "user-1")
+        self.plugin.client.pending_bindings[actor] = ("a" * 64, time.monotonic() + 600)
+        for bot in ("qq_official", "other-bot"):
+            self.assertIsNone(self.module.ScopedCommandFilter.match(self.qq_event(bot=bot)))
+        event = self.qq_event()
+        self.assertEqual(self.module.ScopedCommandFilter.match(event).action, "binding_code")
+        self.assertEqual(self.module.event_actor(event, self.plugin.settings), actor)
+
+    async def test_qq_official_identity_stays_stable_with_both_scopes_allowed(self):
+        await self.use_qq_official([
+            "qq-instance|qq_official|group-1", "qq-instance|bot-openid|group-1",
+        ])
+        self.plugin.client.request = AsyncMock(return_value={
+            "state": "pending",
+            "session_id": hashlib.sha256(("b" * 64).encode()).hexdigest(),
+            "expires_in": 600, "url": "https://example.com/?az_bind=" + "b" * 64,
+        })
+        start = self.qq_event("/网站绑定", "start-1")
+        self.assertEqual(len([r async for r in self.plugin.website_command(start)]), 1)
+        self.assertIn(self.actor, self.plugin.client.pending_bindings)
+        for bot in ("qq_official", "bot-openid"):
+            event = self.qq_event(bot=bot)
+            self.assertEqual(self.module.ScopedCommandFilter.match(event).action, "binding_code")
+            self.assertEqual(self.module.event_actor(event, self.plugin.settings), self.actor)
+
     async def test_no_pending_numeric_chat_untouched(self):
         event = self.event()
         self.assertEqual([r async for r in self.plugin.website_command(event)], [])

@@ -12,6 +12,17 @@ from .commands import Actor, CommandMatch
 from .service import ERROR_MESSAGES, binding_event_identity, execute
 
 
+def event_actor(event: AstrMessageEvent, settings: Settings) -> Actor:
+    actor = Actor(
+        event.get_platform_id(), event.get_self_id(),
+        event.get_group_id(), event.get_sender_id(),
+    )
+    scope = (actor.platform_id, "qq_official", actor.group_id)
+    if event.get_platform_name() == "qq_official" and scope in settings.scopes:
+        return Actor(*scope, actor.sender_id)
+    return actor
+
+
 class ScopedCommandFilter(filter.CustomFilter):
     settings: Settings | None = None
     pending = {}
@@ -28,13 +39,12 @@ class ScopedCommandFilter(filter.CustomFilter):
         ).filter(event, {}):
             return None
         try:
-            actor = Actor(
-                event.get_platform_id(), event.get_self_id(),
-                event.get_group_id(), event.get_sender_id(),
-            )
+            actor = event_actor(event, settings)
         except (ValueError, TypeError, AttributeError):
             return None
-        if actor.scope not in settings.scopes or actor.sender_id == actor.bot_self_id:
+        if actor.scope not in settings.scopes or actor.sender_id in {
+            actor.bot_self_id, event.get_self_id(),
+        }:
             return None
         text = []
         mentioned = False
@@ -44,7 +54,7 @@ class ScopedCommandFilter(filter.CustomFilter):
         for component in messages:
             if isinstance(component, Plain) and isinstance(component.text, str):
                 text.append(component.text)
-            elif isinstance(component, At) and str(component.qq) == actor.bot_self_id:
+            elif isinstance(component, At) and str(component.qq) == event.get_self_id():
                 text.append(" ")
                 mentioned = True
             else:
@@ -126,10 +136,7 @@ class ZibllPlugin(Star):
                 "网站连接尚未通过验证，请管理员检查配置并重载插件。"
             ).use_markdown(False).stop_event()
             return
-        actor = Actor(
-            event.get_platform_id(), event.get_self_id(),
-            event.get_group_id(), event.get_sender_id(),
-        )
+        actor = event_actor(event, self.settings)
         now = time.monotonic()
         for key, value in list(self._processed.items()):
             if value[1] <= now:
