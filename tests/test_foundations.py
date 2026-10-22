@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import hashlib
 import importlib.util
 import json
 import logging
@@ -28,6 +29,7 @@ from astrbot_plugin_zibll.client import (
 from astrbot_plugin_zibll.commands import (
     DEFAULT_COMMANDS,
     Actor,
+    CommandMatch,
     CommandRouter,
     parse_scopes,
 )
@@ -326,30 +328,29 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         return await execute(self.client, self.settings.router.match(text), actor, event)
 
     async def test_binding_start_and_signed_actor_body(self):
-        text, image = await self.run_command("/网站绑定", {"url": self.base + "/?az_bind=" + "a" * 64})
-        self.assertIn("/网站绑定确认", text)
+        self.client.binding_code_available = True
+        text, image = await self.run_command("/网站绑定", {
+            "state": "pending", "session_id": hashlib.sha256(("a" * 64).encode()).hexdigest(), "expires_in": 600,
+            "url": self.base + "/?az_bind=" + "a" * 64,
+        })
+        self.assertIn("六位", text)
+        self.assertNotIn("/网站绑定确认", text)
         self.assertIsNone(image)
         request = self.requests[-1]
         body = json.loads(request.raw)
         self.assertEqual(body["actor"]["sender_id"], "user-1")
         self.assertEqual(request.method, "POST")
         self.assertEqual(request.headers["X-AZ-Signature"], sign_request(
-            "test-client", "test-key", TEST_SECRET, "POST", NAMESPACE + "/binding/start",
+            "test-client", "test-key", TEST_SECRET, "POST", NAMESPACE + "/binding/code/start",
             request.headers["X-AZ-Time"], request.headers["X-AZ-Nonce"], request.raw,
         ))
 
-    async def test_confirmation_uses_website_candidate(self):
-        def reply(request):
-            if request.path.endswith("/binding/status"):
-                data = {"state": "awaiting_confirmation", "uid": 123, "nickname": "Member", "challenge_id": "a" * 64}
-            else:
-                data = {"state": "bound"}
-            return web.json_response({"code": "ok", "data": data})
-        self.reply = reply
+    async def test_old_confirmation_and_unbind_only_guide(self):
         text, _ = await self.run_command("/网站绑定确认 123", {})
-        self.assertIn("绑定成功", text)
-        self.assertEqual(json.loads(self.requests[-1].raw)["expected_uid"], 123)
-        self.assertEqual(json.loads(self.requests[-1].raw)["challenge_id"], "a" * 64)
+        self.assertIn("无需再确认", text)
+        text, _ = await self.run_command("/网站解绑 确认", {})
+        self.assertIn("?az_bindings=1", text)
+        self.assertEqual(self.requests, [])
 
     async def test_search_parameters_and_safe_output(self):
         text, _ = await self.run_command("/网站搜索 子比", {
@@ -679,7 +680,7 @@ def load_main_with_framework_stubs():
         def __init__(self, context):
             self.context = context
 
-    def custom_filter(cls):
+    def custom_filter(cls, **kwargs):
         if not issubclass(cls, CustomFilter):
             raise TypeError("A filter class is required")
         cls(raise_error=True)
@@ -867,6 +868,7 @@ class FilterContractTests(unittest.IsolatedAsyncioTestCase):
         plugin = self.module.ZibllPlugin(object(), config())
         plugin.client = AsyncMock()
         plugin.client.settings = plugin.settings
+        plugin.client.pending_bindings = {}
         await plugin.initialize()
         self.assertTrue(plugin.connected)
         results = [result async for result in plugin.website_command(StubEvent("/网站签到"))]

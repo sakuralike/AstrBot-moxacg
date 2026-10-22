@@ -8,6 +8,7 @@ function business_routes()
 {
     return array(
         'binding/start', 'binding/status', 'binding/confirm', 'binding/revoke',
+        'binding/code/start', 'binding/code/redeem', 'binding/code/status',
         'profile', 'checkin', 'checkin/status', 'articles/latest', 'articles/search',
     );
 }
@@ -23,6 +24,9 @@ function dispatch_business($request)
     }
     $action = substr($request->get_route(), strlen(NAMESPACE_PATH) + 1);
     $input = $request->get_json_params();
+    if (str_starts_with($action, 'binding/code/')) {
+        return binding_code_action($action, $actor, $input);
+    }
     if (str_starts_with($action, 'binding/')) {
         return binding_action($action, $actor, $input);
     }

@@ -19,6 +19,8 @@ function settings()
         'secret' => '',
         'allowed_groups' => array(),
         'allow_local_http' => false,
+        'binding_background_color' => '#fff0f5',
+        'binding_background_image' => '',
     ), is_array($saved) ? $saved : array());
 }
 
@@ -155,6 +157,9 @@ function authorize($request)
             'binding/start' => array(), 'binding/status' => array(),
             'binding/confirm' => array('expected_uid', 'challenge_id'),
             'binding/revoke' => array('confirm'), 'profile' => array(),
+            'binding/code/start' => array('request_id', 'event_time'),
+            'binding/code/redeem' => array('session_id', 'code', 'request_id', 'event_time'),
+            'binding/code/status' => array('session_id', 'request_id'),
             'checkin' => array('request_id', 'event_time'),
             'checkin/status' => array('request_id', 'event_time'),
             'articles/latest' => array('count'), 'articles/search' => array('count', 'keyword'),

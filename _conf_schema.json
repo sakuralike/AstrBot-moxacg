@@ -73,9 +73,9 @@
     "type": "object",
     "description": "群指令（修改后重载；仍需满足核心唤醒前缀或 @机器人）",
     "items": {
-      "bind": {"type": "string", "description": "发起绑定", "default": "/网站绑定"},
-      "confirm": {"type": "string", "description": "绑定确认", "default": "/网站绑定确认"},
-      "unbind": {"type": "string", "description": "解绑", "default": "/网站解绑"},
+      "bind": {"type": "string", "description": "发起绑定（登录网站后回原群 @机器人 发送六位码）", "default": "/网站绑定"},
+      "confirm": {"type": "string", "description": "旧确认入口（仅引导新绑定流程）", "default": "/网站绑定确认"},
+      "unbind": {"type": "string", "description": "解绑入口（仅返回网站授权管理页）", "default": "/网站解绑"},
       "profile": {"type": "string", "description": "本人资料", "default": "/网站资料"},
       "checkin": {"type": "string", "description": "网站签到", "default": "/网站签到"},
       "latest": {"type": "string", "description": "最新文章", "default": "/网站最新"},

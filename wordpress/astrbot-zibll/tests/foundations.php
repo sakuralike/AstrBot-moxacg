@@ -160,6 +160,7 @@ namespace {
     $tables = array(
         $wpdb->options, \AstrBotZibll\state_table(), \AstrBotZibll\binding_table(),
         \AstrBotZibll\daily_table(), \AstrBotZibll\operation_table(),
+        \AstrBotZibll\binding_session_table(), \AstrBotZibll\binding_code_table(),
     );
     $GLOBALS['az_test_admin'] = true;
     $GLOBALS['az_test_theme'] = 'zibll';
@@ -171,6 +172,8 @@ namespace {
         check($wpdb->query("CREATE TABLE {$wpdb->options} LIKE $original_options") !== false, 'Create isolated options');
         \AstrBotZibll\install();
         check(\AstrBotZibll\settings()['enabled'] === false, 'Disabled by default');
+        check(\AstrBotZibll\settings()['binding_background_color'] === '#fff0f5', 'Binding page defaults to pink');
+        check(\AstrBotZibll\settings()['binding_background_image'] === '', 'Background image is optional');
         $autoload = $wpdb->get_var($wpdb->prepare(
             "SELECT autoload FROM {$wpdb->options} WHERE option_name = %s",
             \AstrBotZibll\OPTION
@@ -212,6 +215,36 @@ namespace {
         check(error_is(\AstrBotZibll\save_settings($save), 'key_and_groups_required', 400), 'Cannot enable empty groups');
         $save['allowed_groups'] = 'p|b|g';
         check(\AstrBotZibll\save_settings($save) === null, 'Enable with valid key and scope');
+        $appearance = array_merge($save, array(
+            'binding_background_color' => '#ACE',
+            'binding_background_image' => 'https://images.example.com/wallpaper.jpg?width=1600&quality=90',
+        ));
+        check(\AstrBotZibll\save_settings($appearance) === null, 'Save binding page appearance');
+        check(\AstrBotZibll\settings()['binding_background_color'] === '#aaccee', 'Normalize short hex colors for the native picker');
+        check(\AstrBotZibll\settings()['binding_background_image'] === $appearance['binding_background_image'], 'Preserve background URL query parameters');
+        $before_appearance = \AstrBotZibll\settings();
+        foreach (array('', 'pink', '#12345', '#ffffff;display:none', array()) as $color) {
+            check(error_is(\AstrBotZibll\save_settings(array_merge($appearance, array(
+                'binding_background_color' => $color,
+            ))), 'invalid_background_color', 400), 'Reject invalid background colors');
+            check(\AstrBotZibll\settings() === $before_appearance, 'Invalid color does not partially save');
+        }
+        foreach (array(
+            'javascript:alert(1)', 'data:image/svg+xml,<svg/>', '//example.com/image.jpg',
+            '/image.jpg', 'https://user:fixture@example.com/image.jpg',
+            "https://example.com/a\nb.jpg", 'https://example.com/a" onerror="alert(1)',
+            'https://example.com/' . str_repeat('a', 2048), array(),
+        ) as $image) {
+            check(error_is(\AstrBotZibll\save_settings(array_merge($appearance, array(
+                'binding_background_image' => $image,
+            ))), 'invalid_background_image', 400), 'Reject unsafe background images');
+            check(\AstrBotZibll\settings() === $before_appearance, 'Invalid image does not partially save');
+        }
+        check(\AstrBotZibll\save_settings($save) === null, 'Older settings forms can still save');
+        check(\AstrBotZibll\settings() === $before_appearance, 'Missing appearance fields preserve the saved design');
+        check(\AstrBotZibll\save_settings(array_merge($appearance, array('binding_background_image' => ''))) === null, 'Background image can be cleared');
+        check(\AstrBotZibll\settings()['binding_background_image'] === '', 'Clearing the image restores the color background');
+        check(\AstrBotZibll\save_settings($appearance) === null, 'Restore custom appearance');
         $save['az_action'] = 'revoke';
         check(\AstrBotZibll\save_settings($save) === null, 'Revoke credentials');
         $revoked = \AstrBotZibll\settings();
@@ -288,6 +321,8 @@ namespace {
         check($response->get_status() === 200, 'Real REST dispatch authenticates');
         $data = $response->get_data();
         check(in_array('binding/start', $data['data']['actions'], true), 'Binding capability advertised');
+        check($data['data']['binding_code'] === true, 'Short code capability requires transactional schema');
+        check(in_array('binding/code/redeem', $data['data']['actions'], true), 'New binding routes advertised');
         check($data['data']['public_site_url'] === 'https://localhost:18797', 'Public site URL follows home and request scheme');
         check($data['data']['timezone'] === 'Asia/Shanghai', 'Site timezone is exposed');
         check(!str_contains(wp_json_encode($data), $options['secret']), 'Response excludes secret');
@@ -353,10 +388,13 @@ namespace {
         $html = ob_get_clean();
         check(!str_contains($html, $options['secret']), 'Saved key is not redisplayed on GET');
         check(str_contains($html, 'test-client') && str_contains($html, 'test-csrf'), 'Admin form includes identity and CSRF field');
+        check(str_contains($html, 'name="binding_background_color" value="#aaccee"'), 'Admin exposes the saved color picker');
+        check(str_contains($html, 'name="binding_background_image"'), 'Admin exposes the background URL field');
+        check(str_contains($html, esc_attr($appearance['binding_background_image'])), 'Admin escapes the saved background URL');
         echo "PASS $checks checks (isolated WordPress REST/wpdb; theme and admin identity doubles)\n";
     } finally {
         foreach ($tables as $table) {
-            if (!preg_match('/\Aazt_[0-9a-f]{12}_(options|astrbot_zibll_(state|bindings|daily|operations))\z/', $table)) {
+            if (!preg_match('/\Aazt_[0-9a-f]{12}_(options|astrbot_zibll_(state|bindings|daily|operations|binding_sessions|binding_codes))\z/', $table)) {
                 throw new \RuntimeException('Refusing unsafe test table cleanup.');
             }
             $wpdb->query("DROP TABLE IF EXISTS $table");

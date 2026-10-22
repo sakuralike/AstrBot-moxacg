@@ -124,6 +124,13 @@ function binding_action($action, $actor, $input)
             if (is_wp_error($limit)) {
                 return $limit;
             }
+            $cancelled = binding_transaction(static function () use ($hash) {
+                cancel_actor_codes($hash);
+                return true;
+            });
+            if (is_wp_error($cancelled)) {
+                return $cancelled;
+            }
             $wpdb->query($wpdb->prepare(
                 "DELETE FROM $table WHERE user_id IS NULL AND expires_at < %d AND actor_hash <> %s LIMIT 100",
                 time(), $hash
@@ -191,7 +198,7 @@ function binding_action($action, $actor, $input)
         $previous = $wpdb->suppress_errors(true);
         $saved = $wpdb->update($table, array(
             'user_id' => (int) $user->ID, 'candidate_id' => null,
-            'challenge_hash' => null, 'expires_at' => 0,
+            'challenge_hash' => null, 'expires_at' => 0, 'bound_at' => time(),
         ), array('actor_hash' => $hash));
         $wpdb->suppress_errors($previous);
         return $saved === 1
@@ -202,12 +209,26 @@ function binding_action($action, $actor, $input)
 
 function revoke_binding($actor_hash, $uid)
 {
+    return with_lock('actor:' . $actor_hash, static function () use ($actor_hash, $uid) {
+        return binding_transaction(static function () use ($actor_hash, $uid) {
+            $row = binding_row($actor_hash);
+            if (!$row || !$row['user_id'] || (int) $row['user_id'] !== $uid) {
+                return failure('binding_changed', 409);
+            }
+            clear_binding($actor_hash);
+            return success(array('state' => 'revoked'));
+        });
+    });
+}
+
+function clear_binding($actor_hash)
+{
     global $wpdb;
-    $saved = $wpdb->update(binding_table(), array(
+    cancel_actor_codes($actor_hash);
+    binding_write($wpdb->update(binding_table(), array(
         'user_id' => null, 'candidate_id' => null, 'challenge_hash' => null,
         'expires_at' => 0, 'revoke_until' => 0,
-    ), array('actor_hash' => $actor_hash, 'user_id' => $uid));
-    return $saved === 1 ? success(array('state' => 'revoked')) : failure('binding_changed', 409);
+    ), array('actor_hash' => $actor_hash)));
 }
 
 function browser_authorize($token, $uid, $nonce)
@@ -261,7 +282,8 @@ function binding_page()
     nocache_headers();
     header('Referrer-Policy: no-referrer');
     header('X-Frame-Options: DENY');
-    header("Content-Security-Policy: default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    $style_nonce = bin2hex(random_bytes(16));
+    header("Content-Security-Policy: default-src 'none'; style-src 'nonce-$style_nonce'; script-src 'nonce-$style_nonce'; img-src https: http:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
     if (!transport_allowed(settings())) {
         wp_die('请使用 HTTPS 访问。', '', array('response' => 403));
     }
@@ -275,10 +297,13 @@ function binding_page()
         exit;
     }
     $uid = get_current_user_id();
+    $code_session = $token ? code_session(hash('sha256', $token)) : null;
     $result = null;
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $nonce = isset($_POST['_wpnonce']) && is_string($_POST['_wpnonce']) ? wp_unslash($_POST['_wpnonce']) : '';
-        if ($token) {
+        if ($token && $code_session) {
+            $result = browser_issue_code($token, wp_unslash($_POST));
+        } elseif ($token) {
             $result = settings()['enabled'] === true
                 ? browser_authorize($token, $uid, $nonce) : failure('unavailable', 503);
         } else {
@@ -292,45 +317,91 @@ function binding_page()
             }
         }
     }
-    echo '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
-    echo '<title>网站群聊授权</title><body><main><h1>网站群聊授权</h1>';
-    if ($result !== null) {
-        echo '<p>' . esc_html(is_wp_error($result)
-            ? '操作失败：' . $result->get_error_code()
-            : ($token ? '网站授权已记录，请回原群核对昵称和 UID 并完成绑定确认。' : '授权已撤销。')) . '</p>';
+    $options = settings();
+    $background_color = is_string($options['binding_background_color'])
+        ? sanitize_hex_color($options['binding_background_color']) : null;
+    $background_image = is_string($options['binding_background_image'])
+        ? esc_url_raw($options['binding_background_image'], array('http', 'https')) : '';
+    echo '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
+    echo '<meta name="referrer" content="no-referrer">';
+    echo '<title>网站群聊授权</title><style nonce="' . esc_attr($style_nonce) . '">';
+    readfile(dirname(__DIR__) . '/assets/binding.css');
+    echo ':root{--az-background:' . ($background_color ?: '#fff0f5') . ';}';
+    echo '</style></head><body><div class="az-backdrop" aria-hidden="true">';
+    if ($background_image !== '') {
+        echo '<img id="az-background-image" src="' . esc_url($background_image) . '" alt="" referrerpolicy="no-referrer" hidden>';
+        echo '<script nonce="' . esc_attr($style_nonce) . '">(() => {'
+            . 'const image = document.getElementById("az-background-image");'
+            . 'const reveal = () => { if (image.naturalWidth > 0) image.hidden = false; };'
+            . 'image.addEventListener("load", reveal, { once: true }); reveal();'
+            . '})();</script>';
     }
-    if ($token && settings()['enabled'] === true) {
+    echo '</div>';
+    echo '<main class="az-shell"><div class="az-card"><header class="az-header">';
+    echo '<div class="az-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">'
+        . '<path d="M10 13a5 5 0 0 0 7.1 0l3-3a5 5 0 0 0-7.1-7.1l-1.7 1.7M14 11a5 5 0 0 0-7.1 0l-3 3a5 5 0 0 0 7.1 7.1l1.7-1.7"/>'
+        . '</svg></div><p class="az-eyebrow">ASTRBOT &middot; ACCOUNT LINK</p><h1>网站群聊授权</h1>';
+    echo '<p class="az-subtitle">连接网站账号，与你的群聊身份相遇。</p></header>';
+    echo '<div class="az-account"><div><p class="az-caption">当前登录账号</p><strong>'
+        . esc_html(wp_get_current_user()->display_name) . '</strong></div><span class="az-uid">UID '
+        . (int) $uid . '</span></div>';
+    if ($result !== null) {
+        echo '<p class="az-notice' . (is_wp_error($result) ? ' az-notice-error' : '') . '" role="status">'
+            . esc_html(is_wp_error($result)
+            ? '操作失败：' . $result->get_error_code()
+            : ($code_session ? '请核对当前账号，将授权码由本人发回原群。'
+                : ($token ? '网站授权已记录，请回原群核对昵称和 UID 并完成绑定确认。' : '授权已撤销。'))) . '</p>';
+    }
+    $labels = array('platform_id' => '平台实例', 'bot_self_id' => '机器人', 'group_id' => '群', 'sender_id' => '成员');
+    if ($code_session && $options['enabled'] === true) {
+        render_code_session($code_session, $token, $url, $result, $style_nonce);
+    } elseif ($token && $options['enabled'] === true) {
         $row = $wpdb->get_row($wpdb->prepare(
             'SELECT * FROM ' . binding_table() . ' WHERE challenge_hash = %s AND expires_at >= %d',
             hash('sha256', $token), time()
         ), ARRAY_A);
         if ($row) {
             $identity = json_decode($row['identity'], true);
-            echo '<p>仅当以下身份是你本人且由你发起绑定时授权：</p><dl>';
-            foreach (array('platform_id' => '平台实例', 'bot_self_id' => '机器人', 'group_id' => '群', 'sender_id' => '成员') as $key => $label) {
+            echo '<section aria-labelledby="az-request-title"><h2 class="az-section-title" id="az-request-title">确认群聊身份</h2>';
+            echo '<p class="az-caption">仅当以下身份是你本人且由你发起绑定时授权。</p><dl class="az-identity">';
+            foreach ($labels as $key => $label) {
                 echo '<dt>' . esc_html($label) . '</dt><dd>' . esc_html($identity[$key]) . '</dd>';
             }
-            echo '</dl><p>授权后，你在该群查询时将展示头像、昵称、加入网站天数、等级、UID、积分、已发布文章数及评论数，并可触发本人网站签到。</p>';
-            echo '<p>当前网站 UID：' . (int) $uid . '；昵称：' . esc_html(wp_get_current_user()->display_name) . '</p>';
+            echo '</dl><p class="az-note"><strong>授权范围</strong><br>授权后，你在该群查询时将展示头像、昵称、加入网站天数、等级、UID、积分、已发布文章数及评论数，并可触发本人网站签到。</p>';
             echo '<form method="post" action="' . esc_url($url) . '">';
             wp_nonce_field('az_bind_' . $token, '_wpnonce', false);
-            echo '<button type="submit">同意授权，回原群确认</button></form>';
+            echo '<button class="az-button az-button-primary" type="submit">同意授权，回原群确认 &rarr;</button></form>';
+            echo '<p class="az-after-action">网站授权后，还需回到原群核对昵称与 UID，完成绑定。</p></section>';
         } else {
-            echo '<p>链接已失效，请回群重新发起绑定。</p>';
+            echo '<p class="az-notice" role="status">链接已失效，请回群重新发起绑定。</p>';
         }
+    } elseif ($token) {
+        echo '<p class="az-notice" role="status">网站授权暂不可用，请联系管理员。</p>';
+    } else {
+        echo '<p class="az-note">如需新增授权，请先回群发送绑定指令，再打开机器人回复的本次授权链接。此管理页不生成通用授权码。</p>';
     }
-    echo '<h2>我的已有授权</h2>';
     $rows = $wpdb->get_results($wpdb->prepare(
         'SELECT actor_hash, identity FROM ' . binding_table() . ' WHERE user_id = %d', $uid
     ), ARRAY_A);
+    echo '<section class="az-existing" aria-labelledby="az-existing-title"><div class="az-existing-heading">';
+    echo '<h2 class="az-section-title" id="az-existing-title">我的已有授权</h2><span class="az-count">'
+        . count($rows) . ' 个群聊</span></div>';
+    if (!$rows) {
+        echo '<p class="az-empty">还没有已绑定的群聊。<br>'
+            . ($code_session ? '核对账号后，回原群 @机器人 发送六位授权码。' : '请先回群发起绑定，再按授权页说明操作。') . '</p>';
+    }
     foreach ($rows as $row) {
         $identity = json_decode($row['identity'], true);
-        echo '<form method="post" action="' . esc_url(add_query_arg('az_bindings', '1', home_url('/'))) . '"><p>';
-        echo esc_html(implode(' / ', $identity)) . '</p>';
+        echo '<form class="az-binding" method="post" action="' . esc_url(add_query_arg('az_bindings', '1', home_url('/'))) . '"><dl class="az-identity">';
+        foreach ($labels as $key => $label) {
+            echo '<dt>' . esc_html($label) . '</dt><dd>' . esc_html($identity[$key]) . '</dd>';
+        }
+        echo '</dl>';
         wp_nonce_field('az_revoke_' . $row['actor_hash'], '_wpnonce', false);
         echo '<input type="hidden" name="binding" value="' . esc_attr($row['actor_hash']) . '">';
-        echo '<button type="submit">撤销此群授权</button></form>';
+        echo '<button class="az-button az-button-secondary" type="submit">撤销此群授权</button></form>';
     }
-    echo '</main></body></html>';
+    echo '</section><footer class="az-footer"><a href="' . esc_url(home_url('/')) . '">返回网站</a></footer>';
+    echo '</div></main></body></html>';
     exit;
 }

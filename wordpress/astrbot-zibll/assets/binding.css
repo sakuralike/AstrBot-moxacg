@@ -1,0 +1,173 @@
+:root {
+    color-scheme: light;
+    --az-background: #fff0f5;
+    --az-ink: #4b2938;
+    --az-muted: #7b5969;
+    --az-accent: #923354;
+    --az-line: rgba(147, 62, 96, .13);
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    min-height: 100vh;
+    min-height: 100svh;
+    padding: 48px 20px;
+    display: grid;
+    place-items: center;
+    isolation: isolate;
+    background: var(--az-background);
+    color: var(--az-ink);
+    font: 15px/1.75 "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+}
+.az-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background: radial-gradient(ellipse at 12% 10%, rgba(255, 191, 211, .4), transparent 52%),
+        radial-gradient(ellipse at 90% 85%, rgba(255, 208, 184, .35), transparent 48%);
+}
+.az-backdrop img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center;
+}
+.az-shell { width: min(100%, 680px); }
+.az-card {
+    padding: 36px 40px;
+    border: 1px solid rgba(255, 255, 255, .85);
+    border-radius: 32px;
+    background: rgba(255, 250, 252, .88);
+    box-shadow: 0 24px 80px rgba(112, 39, 67, .12), inset 0 1px 0 #fff;
+    -webkit-backdrop-filter: blur(24px);
+    backdrop-filter: blur(24px);
+    animation: az-arrive .5s ease-out both;
+}
+.az-header { text-align: center; margin-bottom: 28px; }
+.az-mark {
+    width: 58px;
+    height: 58px;
+    display: grid;
+    place-items: center;
+    margin: 0 auto 16px;
+    border: 1px solid rgba(255, 255, 255, .9);
+    border-radius: 20px;
+    color: var(--az-accent);
+    background: linear-gradient(135deg, #ffe3ed, #fff5f8);
+    box-shadow: 0 6px 22px rgba(173, 71, 110, .1);
+}
+.az-mark svg { width: 29px; height: 29px; }
+.az-eyebrow {
+    margin: 0 0 8px;
+    color: var(--az-accent);
+    font: 11px/1.5 Georgia, "Times New Roman", serif;
+    letter-spacing: .22em;
+}
+h1 {
+    margin: 0 0 10px;
+    font: 600 clamp(26px, 5vw, 32px)/1.4 "Noto Serif CJK SC", "Source Han Serif SC", "Songti SC", "SimSun", serif;
+    letter-spacing: .05em;
+}
+.az-subtitle, .az-caption { margin: 0; color: var(--az-muted); font-size: 13px; }
+.az-account {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 16px 20px;
+    margin-bottom: 24px;
+    border: 1px solid var(--az-line);
+    border-radius: 20px;
+    background: rgba(255, 255, 255, .6);
+}
+.az-account > div { min-width: 0; }
+.az-account strong { display: block; font-size: 17px; overflow-wrap: anywhere; }
+.az-uid {
+    flex-shrink: 0;
+    padding: 5px 12px;
+    border-radius: 999px;
+    background: #fbe5ee;
+    color: var(--az-accent);
+    font: 12px/1.6 "Cascadia Code", Consolas, monospace;
+}
+.az-section-title { margin: 0 0 14px; font-size: 16px; font-weight: 600; }
+.az-identity {
+    display: grid;
+    grid-template-columns: 82px minmax(0, 1fr);
+    gap: 10px 12px;
+    margin: 16px 0;
+    padding: 18px 20px;
+    border-radius: 18px;
+    background: rgba(245, 224, 232, .35);
+    font-size: 13px;
+}
+.az-identity dt { color: var(--az-muted); }
+.az-identity dd { margin: 0; overflow-wrap: anywhere; }
+.az-note { margin: 16px 0 20px; font-size: 13px; color: var(--az-muted); }
+.az-note strong { color: var(--az-accent); font-weight: 600; }
+.az-button {
+    display: inline-flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 46px;
+    max-width: 100%;
+    padding: 11px 24px;
+    border: 1px solid rgba(255, 255, 255, .95);
+    border-radius: 999px;
+    background: linear-gradient(125deg, rgba(248, 181, 205, .65), rgba(255, 232, 240, .7));
+    color: #762640;
+    box-shadow: 0 8px 22px rgba(170, 59, 100, .14), inset 0 1px 0 rgba(255, 255, 255, .9);
+    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: blur(14px);
+    font: 600 14px/1.6 "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+    text-align: center;
+    cursor: pointer;
+}
+.az-button:hover { background-color: #f9cfdf; }
+.az-button:focus-visible { outline: 3px solid #ae4a70; outline-offset: 4px; }
+.az-button-primary { width: 100%; }
+.az-button-secondary { min-height: 44px; padding: 8px 20px; font-size: 13px; }
+.az-after-action { margin: 12px 0 0; text-align: center; font-size: 12px; color: var(--az-muted); }
+.az-code { display: block; width: 100%; margin: 10px 0; padding: 14px 8px; border: 1px solid var(--az-line); border-radius: 18px; background: rgba(255,255,255,.65); color: var(--az-accent); text-align: center; font: 600 clamp(22px,7vw,36px)/1.5 monospace; letter-spacing: .18em; }
+#az-code-form, #az-copy { margin-top: 16px; }
+[hidden] { display: none !important; }
+.az-notice {
+    margin: 0 0 24px;
+    padding: 16px 20px;
+    border: 1px solid #ecc4d3;
+    border-radius: 18px;
+    background: #fff0f5;
+    color: #833653;
+    overflow-wrap: anywhere;
+}
+.az-notice-error { border-color: #efbec5; background: #fff1f2; color: #942f43; }
+.az-existing { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--az-line); }
+.az-existing-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.az-existing-heading h2 { margin: 0; }
+.az-count { font-size: 12px; color: var(--az-muted); }
+.az-binding {
+    margin-top: 12px;
+    padding: 18px;
+    border: 1px solid var(--az-line);
+    border-radius: 20px;
+    background: rgba(255, 255, 255, .45);
+}
+.az-binding .az-identity { margin: 0 0 16px; padding: 0; background: none; }
+.az-empty { padding: 18px; border: 1px dashed #e3becd; border-radius: 18px; text-align: center; color: var(--az-muted); font-size: 13px; }
+.az-footer { margin: 22px 0 0; text-align: center; }
+.az-footer a { color: var(--az-accent); font-size: 13px; text-underline-offset: 4px; overflow-wrap: anywhere; }
+@keyframes az-arrive { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@media (max-width: 480px) {
+    body { padding: 24px 14px; }
+    .az-card { padding: 28px 20px; border-radius: 26px; }
+    .az-account { padding: 14px; gap: 10px; }
+    .az-identity { grid-template-columns: 66px minmax(0, 1fr); padding: 16px 14px; gap: 10px; }
+    .az-binding { padding: 16px 14px; }
+    .az-button-secondary { width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .az-card { animation: none; }
+}

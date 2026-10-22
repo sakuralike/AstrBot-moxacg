@@ -126,6 +126,8 @@ class BridgeClient:
         self.settings = settings
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
+        self.binding_code_available = False
+        self.pending_bindings = {}
 
     async def request(self, path: str, payload: dict | None = None) -> dict:
         if self._closed:
@@ -185,6 +187,7 @@ class BridgeClient:
                         "confirmation_expired", "binding_changed", "account_unavailable",
                         "account_restricted", "checkin_disabled", "busy", "event_expired",
                         "event_identity_required", "request_conflict", "invalid_parameters",
+                        "code_invalid", "session_expired", "too_many_attempts",
                     }:
                         code = payload["code"]
                     raise BridgeError(code)
@@ -200,6 +203,7 @@ class BridgeClient:
         return data
 
     async def capabilities(self) -> dict:
+        self.binding_code_available = False
         data = await self.request("/capabilities")
         if data.get("protocol") != PROTOCOL:
             raise BridgeError("protocol_mismatch")
@@ -209,9 +213,17 @@ class BridgeClient:
             raise BridgeError("invalid_response") from None
         if actual_site != self.settings.public_site_url:
             raise BridgeError("site_mismatch")
+        actions = data.get("actions", [])
+        self.binding_code_available = (
+            data.get("binding_code") is True and isinstance(actions, list)
+            and all(action in actions for action in (
+                "binding/code/start", "binding/code/redeem", "binding/code/status",
+            ))
+        )
         return data
 
     async def close(self):
         self._closed = True
+        self.pending_bindings.clear()
         if self._session is not None:
             await self._session.close()

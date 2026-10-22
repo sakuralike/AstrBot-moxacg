@@ -13,6 +13,7 @@ DEFAULT_COMMANDS = {
     "search": "/网站搜索",
 }
 ARGUMENT_ACTIONS = frozenset({"confirm", "unbind", "search"})
+PRIMARY_ACTIONS = frozenset({"bind", "profile", "checkin", "latest", "search"})
 
 
 def valid_identity(value: object) -> bool:
@@ -48,14 +49,18 @@ class CommandMatch:
 
 class CommandRouter:
     def __init__(self, commands: Mapping[str, str]):
-        if not isinstance(commands, Mapping) or set(commands) != set(DEFAULT_COMMANDS):
-            raise ValueError("必须配置全部七项网站指令")
+        if (
+            not isinstance(commands, Mapping) or not PRIMARY_ACTIONS <= set(commands)
+            or set(commands) - set(DEFAULT_COMMANDS)
+        ):
+            raise ValueError("必须配置五项主指令，确认和解绑仅作为可选兼容入口")
         self.commands = dict(commands)
         for name in self.commands.values():
             if (
                 not isinstance(name, str)
                 or not 1 <= len(name) <= 32
                 or any(c.isspace() or unicodedata.category(c).startswith("C") for c in name)
+                or re.fullmatch(r"[0-9]{6}", name)
             ):
                 raise ValueError("指令必须为不含空白或控制字符的 1–32 个字符")
         if len(set(self.commands.values())) != len(self.commands):

@@ -1,9 +1,11 @@
 <?php
 /**
  * Plugin Name: AstrBot Zibll Bridge
+ * Plugin URI: https://moxacg.moe/
  * Description: AstrBot 与 Zibll 的账号授权、本人资料、签到及公开文章桥接。
- * Version: 0.0.0
- * Author: sakuralike
+ * Version: 0.0.1
+ * Author: moxacg
+ * Author URI: https://moxacg.moe/
  * Requires PHP: 8.0
  */
 
@@ -14,10 +16,12 @@ defined('ABSPATH') || exit;
 require_once __DIR__ . '/includes/auth.php';
 require_once __DIR__ . '/includes/admin.php';
 require_once __DIR__ . '/includes/binding.php';
+require_once __DIR__ . '/includes/binding-code.php';
 require_once __DIR__ . '/includes/business.php';
 require_once __DIR__ . '/includes/checkin.php';
 
 register_activation_hook(__FILE__, __NAMESPACE__ . '\\install');
+add_action('plugins_loaded', __NAMESPACE__ . '\\maybe_install');
 add_action('admin_menu', __NAMESPACE__ . '\\admin_menu');
 add_action('rest_api_init', __NAMESPACE__ . '\\register_routes');
 add_filter('rest_post_dispatch', __NAMESPACE__ . '\\private_response', 10, 3);
@@ -35,6 +39,7 @@ function install()
         state_key char(64) NOT NULL,
         expires_at bigint(20) unsigned NOT NULL,
         hits int(10) unsigned NOT NULL DEFAULT 0,
+        payload text DEFAULT NULL,
         PRIMARY KEY  (state_key),
         KEY expires_at (expires_at)
     ) $collate;");
@@ -48,6 +53,7 @@ function install()
         challenge_hash char(64) DEFAULT NULL,
         expires_at bigint(20) unsigned NOT NULL DEFAULT 0,
         revoke_until bigint(20) unsigned NOT NULL DEFAULT 0,
+        bound_at bigint(20) unsigned NOT NULL DEFAULT 0,
         PRIMARY KEY  (actor_hash),
         UNIQUE KEY scope_user (scope_hash,user_id),
         UNIQUE KEY challenge_hash (challenge_hash),
@@ -71,7 +77,18 @@ function install()
         PRIMARY KEY  (request_key),
         KEY expires_at (expires_at)
     ) $collate;");
+    install_binding_codes($collate);
     add_option(OPTION, settings(), '', false);
+    if (binding_schema_ready()) {
+        update_option('astrbot_zibll_schema', 'binding_codes', false);
+    }
+}
+
+function maybe_install()
+{
+    if (get_option('astrbot_zibll_schema') !== 'binding_codes') {
+        install();
+    }
 }
 
 function register_routes()
@@ -92,9 +109,7 @@ function register_routes()
 
 function remove_user_bindings($uid)
 {
-    global $wpdb;
-    $wpdb->delete(binding_table(), array('user_id' => $uid));
-    $wpdb->delete(binding_table(), array('candidate_id' => $uid));
+    remove_user_code_bindings((int) $uid);
 }
 
 function theme_status()
@@ -135,6 +150,8 @@ function capabilities()
             'public_site_url' => untrailingslashit(home_url('/')),
             'timezone' => wp_timezone_string(),
             'actions' => array_merge(array('capabilities'), business_routes()),
+            'binding_code' => binding_schema_ready() && binding_transactions_ready(),
+            'management_url' => add_query_arg('az_bindings', '1', home_url('/')),
             'theme' => $theme,
         ),
     ));

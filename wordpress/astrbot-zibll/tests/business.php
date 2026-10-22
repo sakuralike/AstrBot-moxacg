@@ -17,7 +17,7 @@ $_SERVER['HTTPS'] = 'on';
 $_SERVER['REQUEST_METHOD'] = 'GET';
 $_SERVER['REQUEST_URI'] = '/';
 
-if (($argv[1] ?? '') !== '--run' && ($argv[1] ?? '') !== '--checkin-worker') {
+if (!in_array($argv[1] ?? '', array('--run', '--checkin-worker', '--page-worker', '--code-worker'), true)) {
     define('SHORTINIT', true);
     require ABSPATH . 'wp-load.php';
     $prefix = 'azb_' . bin2hex(random_bytes(6)) . '_';
@@ -97,6 +97,23 @@ require dirname(__DIR__) . '/astrbot-zibll.php';
 if (wp_using_ext_object_cache()) {
     throw new RuntimeException('Shared object cache is not permitted.');
 }
+if ($argv[1] === '--page-worker') {
+    wp_set_current_user((int) $argv[3]);
+    $token = $argv[4] ?? '';
+    $_GET = $token ? array('az_bind' => $token) : array('az_bindings' => '1');
+    if (($argv[5] ?? '') === 'authorize') {
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_POST['_wpnonce'] = wp_create_nonce('az_bind_' . $token);
+    } elseif (($argv[5] ?? '') === 'issue_code') {
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_POST = array(
+            '_wpnonce' => wp_create_nonce('az_code_' . $token),
+            'issue_key' => bin2hex(random_bytes(16)), 'az_action' => 'issue_code',
+        );
+    }
+    AstrBotZibll\binding_page();
+    exit(2);
+}
 $checks = 0;
 function verify($condition, $label)
 {
@@ -160,6 +177,28 @@ if ($argv[1] === '--checkin-worker') {
         'request_id' => hash('sha256', $argv[4]), 'event_time' => time(),
     ), false);
     echo is_wp_error($response) ? $response->get_error_code() : $response->get_data()['data']['state'];
+    exit;
+}
+
+if ($argv[1] === '--code-worker') {
+    $payload = json_decode(base64_decode($argv[3]), true);
+    while (microtime(true) < (float) $argv[4]) {
+        usleep(1000);
+    }
+    if ($payload['action'] === 'admin') {
+        wp_set_current_user($payload['uid']);
+        $result = AstrBotZibll\admin_revoke_bindings(array(
+            'az_action' => 'revoke_one', 'binding' => $payload['hash'],
+            '_wpnonce' => wp_create_nonce('astrbot_zibll_bindings'),
+        ));
+        echo is_wp_error($result) ? $result->get_error_code() : $result[0]['state'];
+    } elseif ($payload['action'] === 'revoke') {
+        $result = AstrBotZibll\revoke_binding($payload['hash'], $payload['uid']);
+        echo is_wp_error($result) ? $result->get_error_code() : $result->get_data()['data']['state'];
+    } else {
+        $result = AstrBotZibll\binding_code_action('binding/code/redeem', $payload['actor'], $payload['input']);
+        echo is_wp_error($result) ? $result->get_error_code() : $result->get_data()['data']['state'];
+    }
     exit;
 }
 
@@ -426,4 +465,72 @@ for ($i = 0; $i < 10; ++$i) {
     call_api('articles/latest', $actor);
 }
 verify(call_api('articles/latest', $actor)->get_status() === 429, 'Independent website actor rate limiting');
+
+function render_binding_fixture($uid, $token = '', $action = '')
+{
+    global $wpdb;
+    $process = proc_open(array(
+        PHP_BINARY, __FILE__, '--page-worker', $wpdb->prefix, (string) $uid, $token, $action,
+    ), array(0 => array('pipe', 'r'), 1 => array('pipe', 'w'), 2 => array('pipe', 'w')), $pipes);
+    fclose($pipes[0]);
+    $html = stream_get_contents($pipes[1]);
+    $errors = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    verify(proc_close($process) === 0 && $errors === '', 'Binding page renders without PHP errors: ' . $errors);
+    return $html;
+}
+
+clear_fixture_limits();
+$page_actor = array_merge($actor, array('sender_id' => str_repeat('F1799F40', 16)));
+$start = call_api('binding/start', $page_actor)->get_data()['data'];
+parse_str(parse_url($start['url'], PHP_URL_QUERY), $query);
+$page_token = $query['az_bind'];
+$page = render_binding_fixture($uid, $page_token);
+verify(str_contains($page, 'class="az-shell"') && str_contains($page, 'backdrop-filter: blur('), 'Binding page includes centered glass styling');
+verify(preg_match('/<style nonce="[0-9a-f]{32}">/', $page) === 1, 'Styles carry a per-response CSP nonce');
+verify(str_contains($page, ':root{--az-background:#fff0f5;}'), 'Existing settings receive the default pink background');
+verify(str_contains($page, 'name="_wpnonce"') && str_contains($page, 'method="post"'), 'Styled authorization form retains POST and CSRF');
+verify(str_contains($page, esc_html($page_actor['sender_id'])), 'Full group identity is available for review');
+verify(!str_contains($page, AstrBotZibll\settings()['secret']), 'Binding page does not expose the bridge secret');
+$page_options = AstrBotZibll\settings();
+$page_options['binding_background_color'] = '#dce8f2';
+$page_options['binding_background_image'] = 'https://images.example.com/wallpaper.svg?size=large&crop=cover';
+update_option(AstrBotZibll\OPTION, $page_options, false);
+$custom_page = render_binding_fixture($uid, $page_token);
+verify(str_contains($custom_page, ':root{--az-background:#dce8f2;}'), 'Custom background color reaches the rendered CSS');
+verify(str_contains($custom_page, 'src="' . esc_url($page_options['binding_background_image']) . '"'), 'Custom background image URL preserves query parameters');
+verify(str_contains($custom_page, 'referrerpolicy="no-referrer" hidden'), 'Background image suppresses the referrer and stays hidden until loaded');
+preg_match('/<style nonce="([0-9a-f]{32})">/', $custom_page, $page_nonce);
+verify(str_contains($custom_page, '<script nonce="' . $page_nonce[1] . '">'), 'Background reveal script carries the response CSP nonce');
+update_option(AstrBotZibll\OPTION, array_merge($page_options, array(
+    'binding_background_color' => '#ffffff;display:none',
+    'binding_background_image' => 'https://images.example.com/")</style><script>alert(1)</script>',
+)), false);
+$escaped_page = render_binding_fixture($uid, $page_token);
+verify(substr_count($escaped_page, '</style>') === 1 && !str_contains($escaped_page, '<script>'), 'Stored image values cannot inject markup');
+verify(str_contains($escaped_page, ':root{--az-background:#fff0f5;}'), 'Invalid stored colors fall back safely');
+$page_options['binding_background_image'] = '';
+update_option(AstrBotZibll\OPTION, $page_options, false);
+$color_page = render_binding_fixture($uid, $page_token);
+verify(str_contains($color_page, ':root{--az-background:#dce8f2;}') && !str_contains($color_page, '<img'), 'Custom color works without an image');
+$authorized_page = render_binding_fixture($uid, $page_token, 'authorize');
+verify(str_contains($authorized_page, '网站授权已记录，请回原群核对昵称和 UID'), 'Styled form submission still requires original-group confirmation');
+$page_status = call_api('binding/status', $page_actor)->get_data()['data'];
+verify($page_status['state'] === 'awaiting_confirmation', 'Website rendering never bypasses group confirmation');
+verify(call_api('binding/confirm', $page_actor, array(
+    'expected_uid' => $uid, 'challenge_id' => $page_status['challenge_id'],
+))->get_data()['data']['state'] === 'bound', 'Original-group confirmation completes the styled authorization flow');
+$management_page = render_binding_fixture($uid);
+$expired_page = render_binding_fixture($uid, str_repeat('0', 64));
+verify(str_contains($expired_page, '链接已失效') && !str_contains($expired_page, 'class="az-button az-button-primary"'), 'Expired links have no authorization button');
+$empty_page = render_binding_fixture($uid6);
+verify(str_contains($empty_page, '还没有已绑定的群聊'), 'Empty bindings have a visible state');
+verify(str_contains($management_page, 'name="binding"') && str_contains($management_page, '撤销此群授权'), 'Existing bindings retain the revocation form');
+if ($preview_dir = getenv('AZ_BINDING_PREVIEW_DIR')) {
+    foreach (array('default' => $page, 'custom' => $custom_page, 'color' => $color_page, 'authorized' => $authorized_page, 'expired' => $expired_page, 'empty' => $empty_page, 'management' => $management_page) as $name => $html) {
+        file_put_contents($preview_dir . '/' . $name . '.html', $html);
+    }
+}
+require __DIR__ . '/binding-codes.php';
 echo "PASS $checks business checks (real WordPress and Zibll, isolated fixture tables)\n";

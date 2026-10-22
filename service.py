@@ -7,7 +7,7 @@ import re
 import time
 import unicodedata
 from dataclasses import asdict
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .avatar import fetch_avatar
 from .client import BridgeClient, BridgeError
@@ -36,6 +36,11 @@ ERROR_MESSAGES = {
     "unavailable": "网站桥接或主题能力暂不可用，请管理员检查。",
     "network_error": "网站连接超时或失败，请稍后查询。",
     "invalid_parameters": "指令参数无效，请检查输入。",
+    "code_invalid": "授权码无效、已过期或不属于本次绑定，请核对本人的授权页面。",
+    "session_expired": "本次绑定会话已结束，请重新发送绑定指令。",
+    "too_many_attempts": "本次授权码错误次数已达上限，请重新发起绑定。",
+    "binding_upgrade_required": "网站桥接尚不支持六位授权码，请管理员先更新网站端插件；其他网站功能不受影响。",
+    "binding_event_required": "适配器未提供有效消息 ID 或时间，无法安全绑定，请管理员检查。",
 }
 
 
@@ -55,8 +60,14 @@ def safe_link(value: object, public_site: str, binding: bool = False) -> str:
         raise BridgeError("invalid_response")
     if any(c in value for c in "\\[]"):
         raise BridgeError("invalid_response")
-    if binding and not url.query.startswith("az_bind="):
-        raise BridgeError("invalid_response")
+    if binding:
+        query = parse_qs(url.query, keep_blank_values=True)
+        if (
+            set(query) != {"az_bind"} or len(query["az_bind"]) != 1
+            or not re.fullmatch(r"[0-9a-f]{64}", query["az_bind"][0])
+            or url.fragment or url.path != public.path.rstrip("/") + "/"
+        ):
+            raise BridgeError("invalid_response")
     return value
 
 
@@ -86,7 +97,7 @@ def checkin_text(data: dict) -> str:
     )
 
 
-def event_identity(event, actor: Actor) -> dict:
+def event_identity(event, actor: Actor, action: str = "checkin") -> dict:
     message = getattr(event, "message_obj", None)
     message_id = getattr(message, "message_id", None)
     timestamp = getattr(message, "timestamp", None)
@@ -98,7 +109,7 @@ def event_identity(event, actor: Actor) -> dict:
         or abs(time.time() - timestamp) > 180
     ):
         raise BridgeError("event_identity_required")
-    key = json.dumps([asdict(actor), "checkin", str(message_id)], sort_keys=True, ensure_ascii=False)
+    key = json.dumps([asdict(actor), action, str(message_id)], sort_keys=True, ensure_ascii=False)
     return {"request_id": hashlib.sha256(key.encode()).hexdigest(), "event_time": int(timestamp)}
 
 
@@ -110,41 +121,44 @@ async def execute(
     payload = {"actor": asdict(actor)}
     action, argument = match.action, match.argument
     if action == "bind":
-        data = await client.request("/binding/start", payload)
+        if not client.binding_code_available:
+            raise BridgeError("binding_upgrade_required")
+        identity = binding_event_identity(event, actor, "binding/code/start")
+        try:
+            data = await client.request("/binding/code/start", {**payload, **identity})
+        except BridgeError as error:
+            if error.code in {"network_error", "http_error", "unavailable", "invalid_response", "response_too_large"}:
+                client.pending_bindings.pop(actor, None)
+            raise
+        if data.get("state") == "bound":
+            client.pending_bindings.pop(actor, None)
+            return binding_success(data, settings.public_site_url), None
+        if data.get("state") == "already_started":
+            return "这条绑定消息已处理，请使用先前的授权链接；没有收到链接时，请重新发送一条绑定指令。", None
+        client.pending_bindings.pop(actor, None)
+        session_id, expires_in = data.get("session_id"), data.get("expires_in")
+        if (
+            data.get("state") != "pending" or not isinstance(session_id, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", session_id)
+            or type(expires_in) is not int or not 0 < expires_in <= 600
+        ):
+            raise BridgeError("invalid_response")
         link = safe_link(data.get("url"), settings.public_site_url, True)
+        if hashlib.sha256(parse_qs(urlsplit(link).query)["az_bind"][0].encode()).hexdigest() != session_id:
+            raise BridgeError("invalid_response")
+        client.pending_bindings[actor] = (session_id, time.monotonic() + expires_in)
         return (
-            f"请在 10 分钟内打开网站并登录授权：\n{link}\n"
-            f"授权后回到本群发送 {commands['confirm']} 核对账号，再发送 "
-            f"{commands['confirm']} UID 完成绑定。\n"
-            "不要确认他人的 UID；链接被误用时重新发起绑定。", None
+            f"请打开网站授权页，登录后获取六位授权码：\n{link}\n"
+            "请在 10 分钟内完成，生成的码最多有效 5 分钟。\n"
+            "核对网站账号后，回本群 @机器人 发送页面上的六位码。\n"
+            "不要使用他人发给你的码；插件重载后需重新发起绑定。", None
         )
     if action == "confirm":
-        if argument and not re.fullmatch(r"[1-9][0-9]{0,17}", argument):
-            return f"用法：{commands['confirm']} 或 {commands['confirm']} UID", None
-        data = await client.request("/binding/status", payload)
-        if data.get("state") == "awaiting_website":
-            return ERROR_MESSAGES["website_authorization_required"], None
-        uid = number(data, "uid", "不可用")
-        nickname = safe_text(data.get("nickname"))
-        if data.get("state") == "bound":
-            return f"已绑定：{nickname}（UID：{uid}）", None
-        if data.get("state") != "awaiting_confirmation":
-            raise BridgeError("invalid_response")
-        if not argument:
-            return f"待确认网站账号：{nickname}（UID：{uid}）\n确认是本人后发送：{commands['confirm']} {uid}", None
-        await client.request("/binding/confirm", {
-            **payload, "expected_uid": int(argument), "challenge_id": data.get("challenge_id"),
-        })
-        return f"绑定成功：{nickname}（UID：{uid}）", None
+        return f"无需再确认 UID。请发送 {commands['bind']}，登录网站后回原群 @机器人 发送六位授权码。", None
     if action == "unbind":
-        if argument not in {"", "确认"}:
-            return f"用法：{commands['unbind']} 或 {commands['unbind']} 确认", None
-        data = await client.request("/binding/revoke", {**payload, "confirm": argument == "确认"})
-        if data.get("state") == "revoked":
-            return "已解除本群网站授权。", None
-        if data.get("state") != "confirm_required":
-            raise BridgeError("invalid_response")
-        return f"将解绑网站 UID：{number(data, 'uid')}。两分钟内发送：{commands['unbind']} 确认", None
+        return f"请登录网站授权管理页，点击对应群聊的撤销按钮：\n{settings.public_site_url}/?az_bindings=1", None
+    if action == "binding_code":
+        return await redeem_code(client, actor, argument, event), None
     if action == "profile":
         data = await client.request("/profile", payload)
         text = (
@@ -210,3 +224,53 @@ async def execute(
                 ]
         return "\n".join(lines), None
     raise BridgeError("invalid_parameters")
+
+
+def binding_event_identity(event, actor: Actor, action: str) -> dict:
+    try:
+        return event_identity(event, actor, action)
+    except BridgeError:
+        raise BridgeError("binding_event_required") from None
+
+
+def binding_success(data: dict, public_site: str) -> str:
+    return (
+        f"绑定成功：{safe_text(data.get('nickname'))}（UID：{number(data, 'uid')}）\n"
+        f"解除绑定请进入网站授权管理页：\n{public_site}/?az_bindings=1"
+    )
+
+
+async def redeem_code(client: BridgeClient, actor: Actor, code: str, event) -> str:
+    pending = client.pending_bindings.get(actor)
+    if not pending or pending[1] <= time.monotonic():
+        client.pending_bindings.pop(actor, None)
+        raise BridgeError("session_expired")
+    if not re.fullmatch(r"[0-9]{6}", code):
+        raise BridgeError("invalid_parameters")
+    identity = binding_event_identity(event, actor, "binding/code/redeem")
+    body = {"actor": asdict(actor), "session_id": pending[0], "code": code, **identity}
+    try:
+        data = await client.request("/binding/code/redeem", body)
+    except BridgeError as error:
+        if error.code in {"session_expired", "too_many_attempts", "binding_conflict"}:
+            client.pending_bindings.pop(actor, None)
+        if error.code not in {"network_error", "http_error", "unavailable", "invalid_response", "response_too_large"}:
+            raise
+        try:
+            data = await client.request("/binding/code/status", {
+                "actor": asdict(actor), "session_id": pending[0], "request_id": identity["request_id"],
+            })
+        except BridgeError:
+            return "绑定结果暂未确认，未自动重复兑换；请到网站授权管理页查看，或重新发送绑定指令核对当前状态。"
+    state = data.get("state")
+    if state in {"bound", "revoked", "too_many_attempts"}:
+        client.pending_bindings.pop(actor, None)
+    if state == "bound":
+        return binding_success(data, client.settings.public_site_url)
+    if state in {"code_invalid", "too_many_attempts"}:
+        return ERROR_MESSAGES[state]
+    if state == "revoked":
+        return "该消息已处理，但授权现已失效；没有重新建立绑定。"
+    if state == "not_processed":
+        return "尚未查到本次兑换结果，未自动重试；请先在网站管理页核对授权。"
+    raise BridgeError("invalid_response")
