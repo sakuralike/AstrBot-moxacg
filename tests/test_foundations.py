@@ -624,6 +624,8 @@ class StubEvent:
         self.sender = "user-1"
         self.kind = "group"
         self.is_at_or_wake_command = True
+        self.message_obj = None
+        self.admin = False
         self.stopped = False
         self.llm = None
 
@@ -647,6 +649,9 @@ class StubEvent:
 
     def get_messages(self):
         return self.messages
+
+    def is_admin(self):
+        return self.admin
 
     def plain_result(self, text):
         return StubResult(text)
@@ -840,6 +845,80 @@ class FilterContractTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(messages=messages):
                 event.messages = messages
                 self.assertIsNone(self.match(event))
+
+    def test_adapter_probe_matches_only_explicit_qq_official_bot_mention(self):
+        scopes = frozenset({("qq-instance", "qq_official", "group-1")})
+        self.module.ScopedCommandFilter.settings = dataclasses.replace(
+            self.settings, scopes=scopes
+        )
+        event = StubEvent("/适配器核查")
+        event.platform_name = "qq_official"
+        event.platform = "qq-instance"
+        event.bot = "qq_official"
+        event.messages = [At("qq_official"), Plain("/适配器核查 "), At("target-id")]
+        self.assertEqual(self.match(event).action, "adapter_probe")
+        event.messages = [Plain("/适配器核查")]
+        self.assertIsNone(self.match(event))
+        event.messages = [At("qq_official"), Plain("/适配器核查")]
+        self.assertEqual(self.match(event).argument, "0")
+        event.messages = [At("qq_official"), Plain("/适配器核查 "), At("target-id"), At("second-id")]
+        self.assertIsNone(self.match(event))
+        event.platform_name = "aiocqhttp"
+        self.assertIsNone(self.match(event))
+
+    async def test_adapter_probe_logs_hashed_ids_without_site_request(self):
+        target_id = "target-openid"
+        target_hash = hashlib.sha256(target_id.encode()).hexdigest()[:12]
+        settings = {
+            **config(),
+            "allowed_groups": ["qq-instance|qq_official|group-1"],
+        }
+        plugin = self.module.ZibllPlugin(object(), settings)
+        plugin.client.request = AsyncMock()
+        event = StubEvent("/适配器核查")
+        event.platform_name = "qq_official"
+        event.platform = "qq-instance"
+        event.bot = "qq_official"
+        event.admin = True
+        event.messages = [At("qq_official"), Plain("/适配器核查 "), At(target_id)]
+        event.message_obj = types.SimpleNamespace(
+            type="group",
+            raw_message=types.SimpleNamespace(
+                raw_data={
+                    "content": "<@target-openid>",
+                    "mentions": [{"id": target_id, "is_you": False, "username": "Target Name"}],
+                    "author": {"member_openid": "admin-openid"},
+                    "msg_elements": [{"type": "at", "user_id": target_id}],
+                    "access_token": "do-not-log",
+                },
+                content="<@target-openid>",
+                mentions=[types.SimpleNamespace(
+                    id=target_id, is_you=False, username="Target Name",
+                )],
+                msg_elements=[{"type": "at", "user_id": target_id}],
+                message_type=100,
+                author=types.SimpleNamespace(member_openid="admin-openid"),
+            ),
+        )
+        with self.assertLogs("astrbot-foundation-tests", level="INFO") as captured:
+            replies = [result async for result in plugin.website_command(event)]
+        logged = "\n".join(captured.output)
+        self.assertEqual(len(replies), 1)
+        self.assertIn("适配器核查信息已记录", replies[0].text)
+        self.assertIn(target_hash, logged)
+        self.assertNotIn(target_id, logged)
+        self.assertNotIn("Target Name", logged)
+        self.assertNotIn("do-not-log", logged)
+        plugin.client.request.assert_not_awaited()
+
+        event.sender = target_id
+        event.messages = [At("qq_official"), Plain("/适配器核查")]
+        event.message_obj = types.SimpleNamespace(type="group", raw_message=None)
+        with self.assertLogs("astrbot-foundation-tests", level="INFO") as captured:
+            [result async for result in plugin.website_command(event)]
+        self.assertIn(target_hash, "\n".join(captured.output))
+        plugin.client.request.assert_not_awaited()
+        await plugin.terminate()
 
     def test_disabled_or_invalid_config_does_not_register_business(self):
         for value in ({}, {**config(), "shared_secret": ""}, {**config(), "allowed_groups": []}):

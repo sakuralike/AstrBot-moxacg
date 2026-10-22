@@ -1,6 +1,8 @@
 import hashlib
+import json
 import re
 import time
+from collections.abc import Mapping
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -10,6 +12,167 @@ from astrbot.api.star import Context, Star
 from .client import BridgeClient, BridgeError, Settings
 from .commands import Actor, CommandMatch
 from .service import ERROR_MESSAGES, binding_event_identity, execute
+
+ADAPTER_PROBE_COMMAND = "/适配器核查"
+PROBE_ID_FIELDS = {
+    "id", "qq", "user_id", "sender_id", "target_id", "member_openid",
+    "user_openid", "openid", "group_id", "group_openid", "self_id",
+}
+PROBE_OMIT_FIELDS = {
+    "api", "attachments", "avatar", "cookie", "icon", "secret",
+    "token", "url", "username", "authorization", "signature",
+}
+PROBE_SENSITIVE_PARTS = (
+    "token", "secret", "pass" + "word", "cookie", "authorization", "signature",
+)
+PROBE_OBJECT_FIELDS = {
+    "author", "bot", "content", "group_id", "group_openid", "id", "is_you",
+    "member_openid", "message", "message_type", "mentions", "msg_elements",
+    "raw_data", "raw_message", "self_id", "sender", "type", "user_openid",
+}
+MENTION_ID_PATTERNS = (
+    re.compile(r"<@!?([^>\s]+)>"),
+    re.compile(r'<qqbot-at-user\s+id=["\']([^"\']+)["\']'),
+)
+
+
+def _probe_id(value: object) -> dict:
+    return {
+        "type": type(value).__name__,
+        "sha256_12": hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12],
+    }
+
+
+def _probe_fields(value: object) -> set[str]:
+    names = set()
+    try:
+        names.update(vars(value))
+    except TypeError:
+        pass
+    for item in type(value).__mro__:
+        slots = getattr(item, "__slots__", ())
+        if isinstance(slots, str):
+            names.add(slots)
+        else:
+            names.update(name for name in slots if isinstance(name, str))
+    return names
+
+
+def _probe_target_count(event: AstrMessageEvent, messages: list) -> int:
+    target_ids = []
+    self_id = str(event.get_self_id())
+    for component in messages:
+        if isinstance(component, At):
+            mention_id = str(component.qq)
+            if mention_id != self_id:
+                target_ids.append(mention_id)
+        elif isinstance(component, Plain) and isinstance(component.text, str):
+            for pattern in MENTION_ID_PATTERNS:
+                target_ids.extend(
+                    mention_id
+                    for mention_id in pattern.findall(component.text)
+                    if mention_id != self_id
+                )
+    if target_ids:
+        return len(target_ids)
+    raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+    mentions = getattr(raw_message, "mentions", None)
+    if isinstance(mentions, (list, tuple)):
+        return sum(
+            1
+            for mention in mentions
+            if str(getattr(mention, "id", "")) not in {"", self_id}
+        )
+    return 0
+
+
+def _probe_value(value: object, field: str = "", depth: int = 0):
+    key = field.lower()
+    if any(item in key for item in PROBE_SENSITIVE_PARTS):
+        return "<omitted>"
+    if key in PROBE_OMIT_FIELDS:
+        return "<omitted>"
+    if key in PROBE_ID_FIELDS and value is not None:
+        return _probe_id(value)
+    if depth >= 5:
+        return {"type": type(value).__name__}
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if key in {"content", "text", "message_str"}:
+            return {
+                "length": len(value),
+                "mention_ids": [
+                    _probe_id(match.group(1))
+                    for pattern in MENTION_ID_PATTERNS
+                    for match in pattern.finditer(value)
+                ][:20],
+            }
+        return {"type": "str", "length": len(value)}
+    if isinstance(value, bytes):
+        return {"type": "bytes", "length": len(value)}
+    if isinstance(value, Mapping):
+        return {
+            str(name): _probe_value(item, str(name), depth + 1)
+            for name, item in list(value.items())[:40]
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_probe_value(item, field, depth + 1) for item in list(value)[:20]]
+    available = sorted(
+        name for name in _probe_fields(value)
+        if not name.startswith("_") and not any(
+            item in name.lower()
+            for item in PROBE_SENSITIVE_PARTS
+        )
+    )
+    selected = {
+        name: _probe_value(getattr(value, name), name, depth + 1)
+        for name in available
+        if name in PROBE_OBJECT_FIELDS
+    }
+    return {"type": type(value).__name__, "fields": available[:80], "values": selected}
+
+
+def _adapter_probe_report(event: AstrMessageEvent) -> dict:
+    message_obj = getattr(event, "message_obj", None)
+    raw_message = getattr(message_obj, "raw_message", None)
+    messages = event.get_messages()
+    components = []
+    for component in messages if isinstance(messages, (list, tuple)) else []:
+        if isinstance(component, Plain):
+            components.append({
+                "type": "Plain",
+                "text": _probe_value(component.text, "text"),
+            })
+        elif isinstance(component, At):
+            components.append({"type": "At", "qq": _probe_id(component.qq)})
+        else:
+            components.append({"type": type(component).__name__})
+    raw_fields = {
+        name: _probe_value(getattr(raw_message, name), name)
+        for name in (
+            "mentions", "msg_elements", "raw_data", "message_type", "content",
+            "author", "group_openid", "id",
+        )
+        if raw_message is not None and hasattr(raw_message, name)
+    }
+    return {
+        "platform_name": event.get_platform_name(),
+        "scope": {
+            "platform_id": _probe_id(event.get_platform_id()),
+            "bot_self_id": _probe_id(event.get_self_id()),
+            "group_id": _probe_id(event.get_group_id()),
+            "sender_id": _probe_id(event.get_sender_id()),
+        },
+        "message_type": str(getattr(message_obj, "type", "")),
+        "event_messages": components,
+        "raw_message_type": type(raw_message).__name__ if raw_message is not None else None,
+        "raw_message_fields": [
+            name for name in sorted(_probe_fields(raw_message))
+            if not any(item in name.lower() for item in PROBE_SENSITIVE_PARTS)
+        ][:80] if raw_message is not None else [],
+        "raw_message": raw_fields,
+    }
 
 
 def event_actor(event: AstrMessageEvent, settings: Settings) -> Actor:
@@ -51,6 +214,26 @@ class ScopedCommandFilter(filter.CustomFilter):
         messages = event.get_messages()
         if not isinstance(messages, (list, tuple)):
             return None
+        if event.get_platform_name() == "qq_official":
+            probe_text = []
+            bot_mentioned = False
+            probe_safe = True
+            for component in messages:
+                if isinstance(component, Plain) and isinstance(component.text, str):
+                    probe_text.append(component.text)
+                elif isinstance(component, At):
+                    bot_mentioned = bot_mentioned or str(component.qq) == event.get_self_id()
+                else:
+                    probe_safe = False
+                    break
+            parts = "".join(probe_text).strip().split(maxsplit=1)
+            target_count = _probe_target_count(event, messages)
+            if (
+                probe_safe and bot_mentioned and parts
+                and parts[0] == ADAPTER_PROBE_COMMAND
+                and target_count in {0, 1}
+            ):
+                return CommandMatch("adapter_probe", str(target_count))
         for component in messages:
             if isinstance(component, Plain) and isinstance(component.text, str):
                 text.append(component.text)
@@ -131,6 +314,30 @@ class ZibllPlugin(Star):
             return
         event.should_call_llm(False)
         event.stop_event()
+        if match.action == "adapter_probe":
+            if match.argument == "1":
+                try:
+                    is_admin = event.is_admin()
+                except (AttributeError, TypeError, ValueError):
+                    is_admin = False
+                if not is_admin:
+                    yield event.plain_result(
+                        "带目标成员的适配器核查仅允许 AstrBot 管理员执行。"
+                    ).use_markdown(False).stop_event()
+                    return
+            try:
+                report = _adapter_probe_report(event)
+                logger.info(
+                    "QQ Official 适配器核查（ID 已哈希，文本/头像/附件已省略）：%s",
+                    json.dumps(report, ensure_ascii=False, separators=(",", ":")),
+                )
+            except (AttributeError, TypeError, ValueError, RecursionError):
+                logger.warning("QQ Official 适配器核查：事件结构读取失败。")
+            yield event.plain_result(
+                "适配器核查信息已记录到 AstrBot 日志。管理员请发送 @机器人 /适配器核查 @目标群员；"
+                "目标群员再单独发送 @机器人 /适配器核查，对照两条日志中的 ID 哈希。"
+            ).use_markdown(False).stop_event()
+            return
         if not self.connected:
             yield event.plain_result(
                 "网站连接尚未通过验证，请管理员检查配置并重载插件。"
