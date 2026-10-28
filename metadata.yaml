@@ -1,6 +1,6 @@
 name: astrbot_plugin_zibll
 display_name: Moxacg 网站联动
 desc: Zibll/WordPress 群聊账号绑定、个人资料、网站签到、最新文章及标题搜索。
-version: 0.0.7
+version: 0.0.8
 author: sakuralike
 repo: https://github.com/sakuralike/AstrBot-moxacg
