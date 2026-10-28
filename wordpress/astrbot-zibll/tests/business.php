@@ -9,6 +9,7 @@ define('DONOTCACHEPAGE', true);
 define('WP_DISABLE_FATAL_ERROR_HANDLER', true);
 require_once ABSPATH . 'wp-includes/plugin.php';
 add_filter('enable_loading_advanced_cache_dropin', static fn() => false);
+add_filter('enable_loading_object_cache_dropin', static fn() => false);
 add_filter('pre_http_request', static fn() => new WP_Error('test_network_disabled'));
 add_filter('pre_wp_mail', static fn() => false);
 add_filter('zib_temp_dir', static fn() => sys_get_temp_dir() . '/az-theme-test');
@@ -17,7 +18,7 @@ $_SERVER['HTTPS'] = 'on';
 $_SERVER['REQUEST_METHOD'] = 'GET';
 $_SERVER['REQUEST_URI'] = '/';
 
-if (!in_array($argv[1] ?? '', array('--run', '--checkin-worker', '--page-worker', '--code-worker'), true)) {
+if (!in_array($argv[1] ?? '', array('--run', '--checkin-worker', '--page-worker', '--code-worker', '--points-worker'), true)) {
     define('SHORTINIT', true);
     require ABSPATH . 'wp-load.php';
     $prefix = 'azb_' . bin2hex(random_bytes(6)) . '_';
@@ -144,6 +145,16 @@ function call_api($route, $actor, $extra = array())
     return apply_filters('rest_post_dispatch', $server->dispatch($request), $server, $request);
 }
 
+function spawn_points_worker($table_prefix, $target_sender, $request_label, $amount, $start)
+{
+    $process = proc_open(array(
+        PHP_BINARY, __FILE__, '--points-worker', $table_prefix, $target_sender,
+        $request_label, (string) $amount, (string) $start,
+    ), array(0 => array('pipe', 'r'), 1 => array('pipe', 'w'), 2 => array('pipe', 'w')), $pipes);
+    fclose($pipes[0]);
+    return array($process, $pipes);
+}
+
 function clear_fixture_limits()
 {
     global $wpdb;
@@ -177,6 +188,23 @@ if ($argv[1] === '--checkin-worker') {
         'request_id' => hash('sha256', $argv[4]), 'event_time' => time(),
     ), false);
     echo is_wp_error($response) ? $response->get_error_code() : $response->get_data()['data']['state'];
+    exit;
+}
+
+if ($argv[1] === '--points-worker') {
+    $target = array('platform_id' => 'p', 'bot_self_id' => 'bot', 'group_id' => 'g', 'sender_id' => $argv[3]);
+    $event = array('request_id' => hash('sha256', $argv[4]), 'event_time' => time());
+    $start = (float) $argv[6];
+    while (microtime(true) < $start) {
+        usleep(1000);
+    }
+    $GLOBALS['wp_rest_server'] = new WP_REST_Server();
+    do_action('rest_api_init');
+    $response = call_api('points/add', array(
+        'platform_id' => 'p', 'bot_self_id' => 'bot', 'group_id' => 'g', 'sender_id' => '001',
+    ), array_merge(array('target_actor' => $target, 'amount' => (int) $argv[5]), $event));
+    $data = $response->get_data();
+    echo wp_json_encode(array('status' => $response->get_status(), 'data' => $data['data'] ?? null, 'code' => $data['code'] ?? null));
     exit;
 }
 
@@ -214,7 +242,8 @@ do_action('rest_api_init');
 remove_all_actions('user_register');
 $uid = wp_insert_user(array('user_login' => 'fixture-one', 'user_pass' => wp_generate_password(), 'display_name' => 'Test Member'));
 $uid2 = wp_insert_user(array('user_login' => 'fixture-two', 'user_pass' => wp_generate_password(), 'display_name' => 'Other Member'));
-verify(is_int($uid) && is_int($uid2), 'Only isolated fixture users created');
+$points_uid = wp_insert_user(array('user_login' => 'fixture-points', 'user_pass' => wp_generate_password(), 'display_name' => 'Points Member'));
+verify(is_int($uid) && is_int($uid2) && is_int($points_uid), 'Only isolated fixture users created');
 $actor = array('platform_id' => 'p', 'bot_self_id' => 'bot', 'group_id' => 'g', 'sender_id' => '001');
 verify(call_api('profile', $actor)->get_data()['code'] === 'not_bound', 'Profile requires binding');
 verify(call_api('profile', array_merge($actor, array('group_id' => 'forbidden')))->get_status() === 403, 'Website group allowlist enforced');
@@ -235,6 +264,10 @@ verify(call_api('binding/confirm', $actor, array('expected_uid' => $uid, 'challe
 $different = array_merge($actor, array('sender_id' => '002'));
 verify(authorize_actor($different, $uid)->get_data()['code'] === 'binding_conflict', 'Unique website user per scope enforced');
 verify(authorize_actor(array_merge($actor, array('group_id' => 'other')), $uid)->get_status() === 200, 'Cross-group separate authorization allowed');
+$points_target_actor = array_merge($actor, array('sender_id' => '003'));
+$checkin_target_actor = array_merge($actor, array('sender_id' => '004'));
+verify(authorize_actor($points_target_actor, $points_uid)->get_status() === 200, 'Points target actor can bind a separate website user');
+verify(authorize_actor($checkin_target_actor, $uid2)->get_status() === 200, 'Checkin target actor can bind the isolated checkin user');
 clear_fixture_limits();
 $profile = call_api('profile', $actor)->get_data()['data'];
 verify(array_keys($profile) === array('uid', 'nickname', 'avatar_url', 'joined_days', 'level', 'points', 'post_count', 'comment_count'), 'Profile contains only eight requested fields');
@@ -244,6 +277,138 @@ verify(call_api('profile', $actor, array('uid' => $uid2))->get_status() === 400,
 update_user_meta($uid, 'banned', 2);
 verify(call_api('profile', $actor)->get_data()['code'] === 'account_restricted', 'Restricted account denied');
 delete_user_meta($uid, 'banned');
+
+clear_fixture_limits();
+$points_add_event = array('request_id' => hash('sha256', 'points-add'), 'event_time' => time());
+$points_add_input = array_merge(array('target_actor' => $points_target_actor, 'amount' => 50), $points_add_event);
+$points_actor_data = AstrBotZibll\actor_data_from_array($actor);
+$points_add_request_key = AstrBotZibll\points_request_key($points_actor_data['actor_hash'], $points_add_event['request_id']);
+$points_add_order = 'astrbot:' . substr($points_add_request_key, 0, 24);
+$points_record_has = static function ($uid, $order_num, $value, $points) {
+    foreach ((array) zib_get_user_meta($uid, 'points_record', true) as $record) {
+        if (is_array($record)
+            && ($record['order_num'] ?? '') === $order_num
+            && (int) ($record['value'] ?? 0) === $value
+            && (int) ($record['points'] ?? -1) === $points
+        ) {
+            return true;
+        }
+    }
+    return false;
+};
+$points_added = call_api('points/add', $actor, $points_add_input);
+verify($points_added->get_status() === 200 && $points_added->get_data()['data']['state'] === 'completed'
+    && $points_added->get_data()['data']['request_id'] === $points_add_event['request_id']
+    && $points_added->get_data()['data']['action'] === 'add'
+    && $points_added->get_data()['data']['uid'] === $points_uid
+    && $points_added->get_data()['data']['amount'] === 50
+    && $points_added->get_data()['data']['points_after'] === 50, 'Points add completes for the bound target');
+verify(zibpay_get_user_points($points_uid) === 50
+    && $points_record_has($points_uid, $points_add_order, 50, 50), 'Points add writes the Zibll points record');
+$points_added_again = call_api('points/add', $actor, $points_add_input);
+verify($points_added_again->get_status() === 200
+    && $points_added_again->get_data()['data']['state'] === 'completed'
+    && $points_added_again->get_data()['data']['request_id'] === $points_add_event['request_id']
+    && $points_added_again->get_data()['data']['action'] === 'add'
+    && zibpay_get_user_points($points_uid) === 50, 'Repeated points add is idempotent');
+$points_conflict = call_api('points/add', $actor, array_merge($points_add_input, array('amount' => 40)));
+verify($points_conflict->get_status() === 409 && $points_conflict->get_data()['code'] === 'request_conflict'
+    && zibpay_get_user_points($points_uid) === 50, 'Reused points request with changed input is rejected');
+$points_action_conflict = call_api('points/subtract', $actor, array_merge(
+    array('target_actor' => $points_target_actor, 'amount' => 1), $points_add_event
+));
+verify($points_action_conflict->get_status() === 409 && $points_action_conflict->get_data()['code'] === 'request_conflict'
+    && zibpay_get_user_points($points_uid) === 50, 'Reused points request with a different action is rejected');
+$unbound_target = array_merge($actor, array('sender_id' => 'never-bound'));
+$points_unbound = call_api('points/add', $actor, array_merge(
+    array('target_actor' => $unbound_target, 'amount' => 1),
+    array('request_id' => hash('sha256', 'points-unbound'), 'event_time' => time())
+));
+verify($points_unbound->get_status() === 404 && $points_unbound->get_data()['code'] === 'target_not_bound'
+    && zibpay_get_user_points($points_uid) === 50, 'Unbound points target is rejected');
+$points_subtract_event = array('request_id' => hash('sha256', 'points-subtract'), 'event_time' => time());
+$points_subtract_input = array_merge(array('target_actor' => $points_target_actor, 'amount' => 20), $points_subtract_event);
+$points_subtract_actor_data = AstrBotZibll\actor_data_from_array($actor);
+$points_subtract_key = AstrBotZibll\points_request_key(
+    $points_subtract_actor_data['actor_hash'], $points_subtract_event['request_id']
+);
+$points_subtract_order = 'astrbot:' . substr($points_subtract_key, 0, 24);
+$points_subtracted = call_api('points/subtract', $actor, $points_subtract_input);
+verify($points_subtracted->get_status() === 200
+    && $points_subtracted->get_data()['data']['state'] === 'completed'
+    && $points_subtracted->get_data()['data']['points_after'] === 30, 'Points subtract completes without a negative balance');
+verify(zibpay_get_user_points($points_uid) === 30
+    && $points_record_has($points_uid, $points_subtract_order, -20, 30), 'Points subtract writes a negative Zibll points record');
+$points_insufficient = call_api('points/subtract', $actor, array_merge(
+    array('target_actor' => $points_target_actor, 'amount' => 40),
+    array('request_id' => hash('sha256', 'points-insufficient'), 'event_time' => time())
+));
+verify($points_insufficient->get_status() === 409
+    && $points_insufficient->get_data()['code'] === 'insufficient_points'
+    && zibpay_get_user_points($points_uid) === 30, 'Insufficient points never creates a negative balance');
+$insufficient_status = call_api('points/status', $actor, array(
+    'request_id' => hash('sha256', 'points-insufficient'),
+))->get_data()['data'];
+verify($insufficient_status['state'] === 'rejected'
+    && $insufficient_status['request_id'] === hash('sha256', 'points-insufficient')
+    && $insufficient_status['action'] === 'subtract', 'Insufficient points status retains the stable request identity');
+$points_cross_group = call_api('points/add', array_merge($actor, array('group_id' => 'other')), array_merge(
+    array('target_actor' => $points_target_actor, 'amount' => 10),
+    array('request_id' => hash('sha256', 'points-cross-group'), 'event_time' => time())
+));
+verify($points_cross_group->get_status() === 403 && $points_cross_group->get_data()['code'] === 'forbidden'
+    && zibpay_get_user_points($points_uid) === 30, 'Cross-group points target is rejected');
+
+$start = microtime(true) + 3;
+$workers = array(
+    spawn_points_worker($table_prefix, '003', 'points-concurrent-same', 13, $start),
+    spawn_points_worker($table_prefix, '003', 'points-concurrent-same', 13, $start),
+);
+$worker_results = array();
+foreach ($workers as [$process, $pipes]) {
+    $output = trim(stream_get_contents($pipes[1]));
+    $errors = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exit = proc_close($process);
+    $result = json_decode($output, true);
+    verify($exit === 0 && $errors === '' && is_array($result), 'Concurrent duplicate points worker exits cleanly');
+    $worker_results[] = $result;
+}
+verify(count(array_filter($worker_results, static fn($result) => $result['status'] === 200
+    && ($result['data']['state'] ?? '') === 'completed')) === 2, 'Concurrent duplicate points calls return one completed operation');
+AstrBotZibll\fresh_user_meta($points_uid);
+$duplicate_key = AstrBotZibll\points_request_key(
+    AstrBotZibll\actor_data_from_array($actor)['actor_hash'], hash('sha256', 'points-concurrent-same')
+);
+verify(zibpay_get_user_points($points_uid) === 43
+    && $points_record_has($points_uid, 'astrbot:' . substr($duplicate_key, 0, 24), 13, 43),
+    'Concurrent duplicate points calls apply exactly once with a matching ledger entry');
+
+$start = microtime(true) + 3;
+$workers = array(
+    spawn_points_worker($table_prefix, '003', 'points-concurrent-a', 7, $start),
+    spawn_points_worker($table_prefix, '003', 'points-concurrent-b', 11, $start),
+);
+$worker_results = array();
+foreach ($workers as [$process, $pipes]) {
+    $output = trim(stream_get_contents($pipes[1]));
+    $errors = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exit = proc_close($process);
+    $result = json_decode($output, true);
+    verify($exit === 0 && $errors === '' && is_array($result), 'Concurrent distinct points worker exits cleanly');
+    $worker_results[] = $result;
+}
+AstrBotZibll\fresh_user_meta($points_uid);
+$completed_points_workers = count(array_filter($worker_results, static fn($result) => $result['status'] === 200
+    && ($result['data']['state'] ?? '') === 'completed'));
+verify($completed_points_workers === 2,
+    'Concurrent distinct points operations both complete: ' . wp_json_encode($worker_results));
+AstrBotZibll\fresh_user_meta($points_uid);
+verify(zibpay_get_user_points($points_uid) === 61,
+    'Concurrent distinct points operations preserve both balance updates');
 
 remove_all_actions('save_post');
 remove_all_actions('wp_insert_post');
@@ -369,6 +534,7 @@ verify(call_api('profile', $actor)->get_data()['code'] === 'not_bound', 'Revocat
 
 $workers = array();
 $start = microtime(true) + 3;
+$points_worker = spawn_points_worker($table_prefix, '004', 'checkin-lock-shared', 5, $start);
 for ($i = 0; $i < 8; ++$i) {
     $p = proc_open(array(PHP_BINARY, __FILE__, '--checkin-worker', $table_prefix, (string) $uid2, $i === 0 ? 'web' : (string) $i, (string) $start), array(
         0 => array('pipe', 'r'), 1 => array('pipe', 'w'), 2 => array('pipe', 'w'),
@@ -398,10 +564,19 @@ foreach ($workers as [$process, $pipes]) {
 verify(!$worker_failures, 'Parallel real-theme worker exits cleanly: ' . wp_json_encode($worker_failures));
 verify(count(array_filter($states, static fn($s) => $s === 'completed')) === 1, 'One concurrent checkin executes: ' . wp_json_encode($states));
 verify(count(array_filter($states, static fn($s) => in_array($s, array('already_checked_in', 'busy'), true))) === 7, 'Other concurrent calls are idempotent or explicitly busy: ' . wp_json_encode($states));
+$points_output = trim(stream_get_contents($points_worker[1][1]));
+$points_errors = stream_get_contents($points_worker[1][2]);
+fclose($points_worker[1][1]);
+fclose($points_worker[1][2]);
+$points_exit = proc_close($points_worker[0]);
+$points_result = json_decode($points_output, true);
+verify($points_exit === 0 && $points_errors === '' && is_array($points_result)
+    && $points_result['status'] === 200 && ($points_result['data']['state'] ?? '') === 'completed',
+    'Points operation shares the per-user lock with concurrent checkin');
 AstrBotZibll\fresh_user_meta($uid2);
-verify(zibpay_get_user_points($uid2) === 10 && zib_get_user_checkin_all_day($uid2) === 1, 'Parallel calls award once');
+verify(zibpay_get_user_points($uid2) === 15 && zib_get_user_checkin_all_day($uid2) === 1, 'Parallel calls apply checkin and admin points once each');
 $ledger = zib_get_user_meta($uid2, 'points_record', true);
-verify(count($ledger) === 1, 'Web AJAX and bridge concurrent checkin record one reward');
+verify(count($ledger) === 2, 'Web AJAX checkin and bridge points transaction retain both ledger records');
 
 $uid3 = wp_insert_user(array('user_login' => 'fixture-failure', 'user_pass' => wp_generate_password()));
 $throw = static function ($id) use ($uid3) {

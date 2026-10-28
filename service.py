@@ -41,6 +41,15 @@ ERROR_MESSAGES = {
     "too_many_attempts": "本次授权码错误次数已达上限，请重新发起绑定。",
     "binding_upgrade_required": "网站桥接尚不支持六位授权码，请管理员先更新网站端插件；其他网站功能不受影响。",
     "binding_event_required": "适配器未提供有效消息 ID 或时间，无法安全绑定，请管理员检查。",
+    "admin_required": "仅 AstrBot 管理员可以执行积分操作。",
+    "target_not_bound": "目标群员尚未绑定网站账号，无法操作积分。",
+    "points_disabled": "网站积分功能未开启。",
+    "insufficient_points": "目标用户积分不足，未执行扣分。",
+    "points_busy": "网站正在处理该用户的积分操作，请稍后再试。",
+    "points_uncertain": "积分操作结果需要核实，已停止重复执行；请在网站查看积分记录。",
+    "points_update_failed": "网站积分更新失败，未确认完成，请稍后查询。",
+    "points_update_uncertain": "积分操作结果需要核实，已停止重复执行；请在网站查看积分记录。",
+    "uncertain": "积分操作结果需要核实，已停止重复执行；请在网站查看积分记录。",
 }
 
 
@@ -94,6 +103,75 @@ def checkin_text(data: dict) -> str:
         f"当前积分：{number(data, 'points')}\n"
         f"连续签到：{number(data, 'continuous_days')} 天\n"
         f"累计签到：{number(data, 'total_days')} 天"
+    )
+
+
+def points_event_identity(event, actor: Actor) -> dict:
+    return event_identity(event, actor, "points")
+
+
+def parse_points_amount(argument: str, limit: int) -> int:
+    if not isinstance(argument, str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)", argument):
+        raise BridgeError("invalid_parameters")
+    try:
+        amount = int(argument, 10)
+    except (TypeError, ValueError, OverflowError):
+        raise BridgeError("invalid_parameters") from None
+    if amount <= 0 or amount > limit:
+        raise BridgeError("invalid_parameters")
+    return amount
+
+
+def points_text(
+    data: dict,
+    action: str,
+    requested_amount: int,
+    expected_request_id: str,
+) -> str:
+    if action not in {"points_add", "points_subtract"}:
+        raise BridgeError("invalid_response")
+    state = data.get("state")
+    if state in {"uncertain", "pending"}:
+        return "积分操作结果需要核实，已停止重复执行；请在网站查看积分记录。"
+    if state in {"not_processed", "not_started"}:
+        return "尚未查到本次积分操作记录，未自动重试；请先在网站核对积分。"
+    if state == "rejected":
+        error_code = data.get("error_code")
+        if not isinstance(error_code, str):
+            raise BridgeError("invalid_response")
+        raise BridgeError(error_code)
+    if state != "completed":
+        raise BridgeError("invalid_response")
+    if (
+        data.get("request_id") != expected_request_id
+        or data.get("action") != ("add" if action == "points_add" else "subtract")
+    ):
+        raise BridgeError("invalid_response")
+    nickname = safe_text(data.get("nickname"))
+    uid = number(data, "uid")
+    if int(uid) <= 0:
+        raise BridgeError("invalid_response")
+    amount = data.get("amount")
+    if type(amount) is not int or amount <= 0:
+        raise BridgeError("invalid_response")
+    if amount != requested_amount:
+        raise BridgeError("invalid_response")
+    points_before = data.get("points_before")
+    points_after = data.get("points_after")
+    if (
+        type(points_before) is not int or points_before < 0
+        or type(points_after) is not int or points_after < 0
+        or points_after != (
+            points_before + amount
+            if action == "points_add"
+            else points_before - amount
+        )
+    ):
+        raise BridgeError("invalid_response")
+    label = "加积分" if action == "points_add" else "减积分"
+    return (
+        f"{label}完成：{nickname}（UID：{uid}）\n"
+        f"变更积分：{amount}\n当前积分：{points_after}"
     )
 
 
@@ -185,6 +263,43 @@ async def execute(
             except BridgeError:
                 return "签到请求结果未知，未自动重试；请先在网站查看记录并核对奖励。", None
         return checkin_text(data), None
+    if action in {"points_add", "points_subtract"}:
+        target_id = match.target_id
+        if not isinstance(target_id, str):
+            raise BridgeError("invalid_parameters")
+        amount = parse_points_amount(argument, settings.max_points_per_operation)
+        target_actor = Actor(
+            actor.platform_id, actor.bot_self_id, actor.group_id, target_id,
+        )
+        identity = points_event_identity(event, actor)
+        body = {
+            "actor": asdict(actor),
+            "target_actor": asdict(target_actor),
+            "amount": amount,
+            **identity,
+        }
+        route = "/points/add" if action == "points_add" else "/points/subtract"
+        query_status = False
+        try:
+            data = await client.request(route, body)
+        except BridgeError as error:
+            if error.code not in {
+                "network_error", "http_error", "unavailable",
+                "invalid_response", "response_too_large", "uncertain",
+            }:
+                raise
+            query_status = True
+        if not query_status and data.get("state") in {"pending", "uncertain"}:
+            query_status = True
+        if query_status:
+            try:
+                data = await client.request("/points/status", {
+                    "actor": asdict(actor),
+                    "request_id": identity["request_id"],
+                })
+            except BridgeError:
+                return "积分操作结果未知，未自动重试；请先在网站核对积分记录。", None
+        return points_text(data, action, amount, identity["request_id"]), None
     if action in {"latest", "search"}:
         if action == "search" and not 1 <= len(argument.strip()) <= 60:
             return f"用法：{commands['search']} 关键词（1–60 字）", None

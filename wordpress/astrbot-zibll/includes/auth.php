@@ -163,6 +163,9 @@ function authorize($request)
             'checkin' => array('request_id', 'event_time'),
             'checkin/status' => array('request_id', 'event_time'),
             'articles/latest' => array('count'), 'articles/search' => array('count', 'keyword'),
+            'points/add' => array('target_actor', 'amount', 'request_id', 'event_time'),
+            'points/subtract' => array('target_actor', 'amount', 'request_id', 'event_time'),
+            'points/status' => array('request_id'),
         );
         if (!is_array($input) || array_diff(array_keys($input), array_merge(array('actor'), $fields[$action]))) {
             return failure('invalid_parameters', 400);

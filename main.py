@@ -10,7 +10,7 @@ from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.star import Context, Star
 
 from .client import BridgeClient, BridgeError, Settings
-from .commands import Actor, CommandMatch
+from .commands import Actor, CommandMatch, valid_identity
 from .service import ERROR_MESSAGES, binding_event_identity, execute
 
 ADAPTER_PROBE_COMMAND = "/适配器核查"
@@ -34,6 +34,9 @@ MENTION_ID_PATTERNS = (
     re.compile(r"<@!?([^>\s]+)>"),
     re.compile(r'<qqbot-at-user\s+id=["\']([^"\']+)["\']'),
 )
+POINT_ACTIONS = frozenset({"points_add", "points_subtract"})
+POINTS_OPERATOR_REQUIRED = "未配置为积分操作员，无法执行积分操作。"
+POINTS_UNAVAILABLE = "网站积分管理功能当前不可用，请检查网站桥接插件和积分设置。"
 
 
 def _probe_id(value: object) -> dict:
@@ -84,6 +87,67 @@ def _probe_target_count(event: AstrMessageEvent, messages: list) -> int:
             if str(getattr(mention, "id", "")) not in {"", self_id}
         )
     return 0
+
+
+def _field(value: object, name: str):
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _raw_mention_ids(event: AstrMessageEvent) -> list[str]:
+    raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+    mentions = _field(raw_message, "mentions")
+    if not isinstance(mentions, (list, tuple)) or not mentions:
+        mentions = _field(_field(raw_message, "raw_data"), "mentions")
+    if not isinstance(mentions, (list, tuple)):
+        return []
+    result = []
+    for mention in mentions:
+        value = next(
+            (
+                _field(mention, name)
+                for name in ("id", "qq", "user_id", "member_openid", "user_openid")
+                if _field(mention, name) is not None
+            ),
+            None,
+        )
+        if value is not None and valid_identity(str(value)):
+            result.append(str(value))
+    return result
+
+
+def _clean_plain_mentions(text: str) -> tuple[str, list[str]]:
+    ids = []
+    cleaned = text
+    for pattern in MENTION_ID_PATTERNS:
+        ids.extend(pattern.findall(cleaned))
+        cleaned = pattern.sub(" ", cleaned)
+    return cleaned, [str(value) for value in ids if valid_identity(str(value))]
+
+
+def _target_ids(event: AstrMessageEvent, messages: list, self_id: str) -> list[str]:
+    component_ids = []
+    for component in messages:
+        if isinstance(component, At):
+            raw_value = getattr(component, "qq", None)
+            value = str(raw_value) if raw_value is not None else ""
+            if value and value != self_id and value.lower() != "all" and valid_identity(value):
+                component_ids.append(value)
+    if event.get_platform_name() != "qq_official" or component_ids:
+        return component_ids
+
+    raw_ids = _raw_mention_ids(event)
+    raw_targets = {
+        value for value in raw_ids
+        if value != self_id and value.lower() != "all"
+    }
+    ids = []
+    for component in messages:
+        if isinstance(component, Plain) and isinstance(component.text, str):
+            _, embedded = _clean_plain_mentions(component.text)
+            ids.extend(value for value in embedded if value in raw_targets)
+    return ids
 
 
 def _probe_value(value: object, field: str = "", depth: int = 0):
@@ -191,6 +255,7 @@ class ScopedCommandFilter(filter.CustomFilter):
     pending = {}
     processed = {}
     code_ready = False
+    points_ready = False
 
     @classmethod
     def match(cls, event: AstrMessageEvent) -> CommandMatch | None:
@@ -234,19 +299,33 @@ class ScopedCommandFilter(filter.CustomFilter):
                 and target_count in {0, 1}
             ):
                 return CommandMatch("adapter_probe", str(target_count))
+        target_ids = _target_ids(event, messages, str(event.get_self_id()))
         for component in messages:
             if isinstance(component, Plain) and isinstance(component.text, str):
-                text.append(component.text)
+                cleaned, _ = _clean_plain_mentions(component.text)
+                text.append(cleaned)
             elif isinstance(component, At) and str(component.qq) == event.get_self_id():
                 text.append(" ")
                 mentioned = True
+            elif isinstance(component, At):
+                text.append(" ")
             else:
                 return None
         value = "".join(text)
         match = settings.router.match(value)
         if match is not None:
+            if match.action in POINT_ACTIONS:
+                target_id = target_ids[0] if len(target_ids) == 1 else None
+                return CommandMatch(match.action, match.argument, target_id)
+            if target_ids:
+                return None
             return match
-        if not cls.code_ready or not mentioned or not re.fullmatch(r"[0-9]{6}", value.strip()):
+        if (
+            target_ids
+            or not cls.code_ready
+            or not mentioned
+            or not re.fullmatch(r"[0-9]{6}", value.strip())
+        ):
             return None
         pending = cls.pending.get(actor)
         message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
@@ -274,6 +353,7 @@ class ZibllPlugin(Star):
         ScopedCommandFilter.pending = {}
         ScopedCommandFilter.processed = {}
         ScopedCommandFilter.code_ready = False
+        ScopedCommandFilter.points_ready = False
         if config.get("enabled", False) is not True:
             return
         try:
@@ -293,6 +373,7 @@ class ZibllPlugin(Star):
         self.connected = False
         if ScopedCommandFilter.settings is self.settings:
             ScopedCommandFilter.code_ready = False
+            ScopedCommandFilter.points_ready = False
         if self.client is None or self._terminated:
             return
         try:
@@ -303,6 +384,7 @@ class ZibllPlugin(Star):
         if not self._terminated and ScopedCommandFilter.settings is self.settings:
             self.connected = True
             ScopedCommandFilter.code_ready = self.client.binding_code_available
+            ScopedCommandFilter.points_ready = self.client.points_management_available
             logger.info("AstrBot-Zibll 认证连通验证通过。")
 
     @filter.custom_filter(ScopedCommandFilter, priority=100)
@@ -343,6 +425,23 @@ class ZibllPlugin(Star):
                 "网站连接尚未通过验证，请管理员检查配置并重载插件。"
             ).use_markdown(False).stop_event()
             return
+        if match.action in POINT_ACTIONS:
+            actor = event_actor(event, self.settings)
+            if actor.sender_id not in self.settings.points_operator_ids:
+                yield event.plain_result(POINTS_OPERATOR_REQUIRED).use_markdown(False).stop_event()
+                return
+            target_ids = _target_ids(
+                event, event.get_messages(), str(event.get_self_id()),
+            )
+            if len(target_ids) != 1 or match.target_id != target_ids[0]:
+                command = self.settings.router.commands[match.action]
+                yield event.plain_result(
+                    f"用法：{command} 正整数 @群成员"
+                ).use_markdown(False).stop_event()
+                return
+            if not self.client.points_management_available:
+                yield event.plain_result(POINTS_UNAVAILABLE).use_markdown(False).stop_event()
+                return
         actor = event_actor(event, self.settings)
         now = time.monotonic()
         for key, value in list(self._processed.items()):
@@ -415,6 +514,7 @@ class ZibllPlugin(Star):
             ScopedCommandFilter.pending = {}
             ScopedCommandFilter.processed = {}
             ScopedCommandFilter.code_ready = False
+            ScopedCommandFilter.points_ready = False
         self._processed.clear()
         self.connected = False
         if self.client is not None:

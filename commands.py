@@ -11,9 +11,16 @@ DEFAULT_COMMANDS = {
     "checkin": "/网站签到",
     "latest": "/网站最新",
     "search": "/网站搜索",
+    "points_add": "/加积分",
+    "points_subtract": "/减积分",
 }
-ARGUMENT_ACTIONS = frozenset({"confirm", "unbind", "search"})
-PRIMARY_ACTIONS = frozenset({"bind", "profile", "checkin", "latest", "search"})
+ARGUMENT_ACTIONS = frozenset({
+    "confirm", "unbind", "search", "points_add", "points_subtract",
+})
+PRIMARY_ACTIONS = frozenset({
+    "bind", "profile", "checkin", "latest", "search",
+    "points_add", "points_subtract",
+})
 
 
 def valid_identity(value: object) -> bool:
@@ -45,6 +52,7 @@ class Actor:
 class CommandMatch:
     action: str
     argument: str
+    target_id: str | None = None
 
 
 class CommandRouter:

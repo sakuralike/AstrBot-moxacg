@@ -5,12 +5,13 @@ import json
 import re
 import secrets
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 import aiohttp
 
-from .commands import DEFAULT_COMMANDS, CommandRouter, parse_scopes
+from .commands import DEFAULT_COMMANDS, CommandRouter, parse_scopes, valid_identity
 
 NAMESPACE = "/astrbot-zibll/v1"
 PROTOCOL = "AZ-HMAC-SHA256"
@@ -59,6 +60,8 @@ class Settings:
     allow_local_http: bool
     latest_count: int = 5
     search_count: int = 5
+    max_points_per_operation: int = 100000
+    points_operator_ids: frozenset[str] = frozenset()
     avatar_hosts: frozenset[str] = frozenset()
 
     @classmethod
@@ -82,17 +85,37 @@ class Settings:
         counts = [config.get("latest_count", 5), config.get("search_count", 5)]
         if any(type(v) is not int or not 1 <= v <= 10 for v in counts):
             raise ValueError("文章条数必须为 1–10")
+        max_points = config.get("max_points_per_operation", 100000)
+        if type(max_points) is not int or not 1 <= max_points <= 100000:
+            raise ValueError("单次积分操作上限必须为 1–100000 的整数")
+        operator_ids = config.get("points_operator_ids", [])
+        if not isinstance(operator_ids, list) or len(operator_ids) > 100:
+            raise ValueError("积分操作员 ID 必须为列表，最多 100 项")
+        if any(not valid_identity(value) for value in operator_ids):
+            raise ValueError("积分操作员 ID 必须为非空且不含空白、控制字符或竖线的文本")
         hosts = config.get("avatar_hosts", [])
         if not isinstance(hosts, list) or len(hosts) > 30:
             raise ValueError("头像域名必须为列表，最多 30 项")
         if any(not isinstance(h, str) or not re.fullmatch(r"[a-zA-Z0-9.-]{1,253}", h) for h in hosts):
             raise ValueError("头像域名不含协议、端口、路径或通配符")
+        configured_commands = config.get("commands", DEFAULT_COMMANDS)
+        if isinstance(configured_commands, Mapping):
+            configured_commands = {**DEFAULT_COMMANDS, **configured_commands}
         return cls(
-            api, public, client, key, secret,
-            parse_scopes(config.get("allowed_groups", [])),
-            CommandRouter(config.get("commands", DEFAULT_COMMANDS)),
-            timeout, local_http, *counts,
-            frozenset([urlsplit(public).hostname, *(h.lower() for h in hosts)]),
+            api_base_url=api,
+            public_site_url=public,
+            client_id=client,
+            key_id=key,
+            secret=secret,
+            scopes=parse_scopes(config.get("allowed_groups", [])),
+            router=CommandRouter(configured_commands),
+            timeout=timeout,
+            allow_local_http=local_http,
+            latest_count=counts[0],
+            search_count=counts[1],
+            max_points_per_operation=max_points,
+            points_operator_ids=frozenset(operator_ids),
+            avatar_hosts=frozenset([urlsplit(public).hostname, *(h.lower() for h in hosts)]),
         )
 
 
@@ -127,6 +150,7 @@ class BridgeClient:
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
         self.binding_code_available = False
+        self.points_management_available = False
         self.pending_bindings = {}
 
     async def request(self, path: str, payload: dict | None = None) -> dict:
@@ -188,6 +212,9 @@ class BridgeClient:
                         "account_restricted", "checkin_disabled", "busy", "event_expired",
                         "event_identity_required", "request_conflict", "invalid_parameters",
                         "code_invalid", "session_expired", "too_many_attempts",
+                        "admin_required", "target_not_bound", "points_disabled",
+                        "insufficient_points", "points_busy", "points_uncertain",
+                        "points_update_failed", "uncertain",
                     }:
                         code = payload["code"]
                     raise BridgeError(code)
@@ -204,6 +231,7 @@ class BridgeClient:
 
     async def capabilities(self) -> dict:
         self.binding_code_available = False
+        self.points_management_available = False
         data = await self.request("/capabilities")
         if data.get("protocol") != PROTOCOL:
             raise BridgeError("protocol_mismatch")
@@ -220,10 +248,19 @@ class BridgeClient:
                 "binding/code/start", "binding/code/redeem", "binding/code/status",
             ))
         )
+        self.points_management_available = (
+            data.get("points_management") is True
+            and isinstance(actions, list)
+            and all(action in actions for action in (
+                "points/add", "points/subtract", "points/status",
+            ))
+        )
         return data
 
     async def close(self):
         self._closed = True
+        self.binding_code_available = False
+        self.points_management_available = False
         self.pending_bindings.clear()
         if self._session is not None:
             await self._session.close()

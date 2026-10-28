@@ -10,6 +10,7 @@ function business_routes()
         'binding/start', 'binding/status', 'binding/confirm', 'binding/revoke',
         'binding/code/start', 'binding/code/redeem', 'binding/code/status',
         'profile', 'checkin', 'checkin/status', 'articles/latest', 'articles/search',
+        'points/add', 'points/subtract', 'points/status',
     );
 }
 
@@ -32,6 +33,9 @@ function dispatch_business($request)
     }
     if (str_starts_with($action, 'articles/')) {
         return articles($action === 'articles/search', $input);
+    }
+    if (str_starts_with($action, 'points/')) {
+        return points_action($action, $actor, $input);
     }
     return with_lock('actor:' . $actor['actor_hash'], static function () use ($action, $actor, $input) {
         $user = bound_user($actor['actor_hash']);

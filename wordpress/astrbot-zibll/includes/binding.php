@@ -21,7 +21,11 @@ function success($data)
 function actor_data($request)
 {
     $input = $request->get_json_params();
-    $actor = $input['actor'] ?? null;
+    return actor_data_from_array($input['actor'] ?? null);
+}
+
+function actor_data_from_array($actor, $required_scope = null)
+{
     $keys = array('platform_id', 'bot_self_id', 'group_id', 'sender_id');
     if (!is_array($actor) || count($actor) !== 4 || array_diff($keys, array_keys($actor))) {
         return failure('invalid_parameters', 400);
@@ -34,7 +38,9 @@ function actor_data($request)
         $fields[] = $actor[$key];
     }
     $options = settings();
-    if (!in_array(implode('|', array_slice($fields, 0, 3)), $options['allowed_groups'], true)
+    $scope_value = implode('|', array_slice($fields, 0, 3));
+    if (!in_array($scope_value, $options['allowed_groups'], true)
+        || ($required_scope !== null && $scope_value !== $required_scope)
         || $actor['sender_id'] === $actor['bot_self_id']
     ) {
         return failure('forbidden', 403);

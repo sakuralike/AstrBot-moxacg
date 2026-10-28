@@ -52,6 +52,7 @@ namespace {
     define('WP_DISABLE_FATAL_ERROR_HANDLER', true);
     require_once ABSPATH . 'wp-includes/plugin.php';
     add_filter('enable_loading_advanced_cache_dropin', static fn() => false);
+    add_filter('enable_loading_object_cache_dropin', static fn() => false);
     $_SERVER['HTTP_HOST'] = 'localhost:18797';
     $_SERVER['HTTPS'] = 'on';
     require ABSPATH . 'wp-load.php';
@@ -161,6 +162,7 @@ namespace {
         $wpdb->options, \AstrBotZibll\state_table(), \AstrBotZibll\binding_table(),
         \AstrBotZibll\daily_table(), \AstrBotZibll\operation_table(),
         \AstrBotZibll\binding_session_table(), \AstrBotZibll\binding_code_table(),
+        \AstrBotZibll\points_table(),
     );
     $GLOBALS['az_test_admin'] = true;
     $GLOBALS['az_test_theme'] = 'zibll';
@@ -394,7 +396,7 @@ namespace {
         echo "PASS $checks checks (isolated WordPress REST/wpdb; theme and admin identity doubles)\n";
     } finally {
         foreach ($tables as $table) {
-            if (!preg_match('/\Aazt_[0-9a-f]{12}_(options|astrbot_zibll_(state|bindings|daily|operations|binding_sessions|binding_codes))\z/', $table)) {
+            if (!preg_match('/\Aazt_[0-9a-f]{12}_(options|astrbot_zibll_(state|bindings|daily|operations|binding_sessions|binding_codes|points_operations))\z/', $table)) {
                 throw new \RuntimeException('Refusing unsafe test table cleanup.');
             }
             $wpdb->query("DROP TABLE IF EXISTS $table");

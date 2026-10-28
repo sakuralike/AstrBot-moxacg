@@ -3,7 +3,7 @@
  * Plugin Name: AstrBot Zibll Bridge
  * Plugin URI: https://moxacg.moe/
  * Description: AstrBot 与 Zibll 的账号授权、本人资料、签到及公开文章桥接。
- * Version: 0.0.1
+ * Version: 0.0.2
  * Author: moxacg
  * Author URI: https://moxacg.moe/
  * Requires PHP: 8.0
@@ -19,6 +19,7 @@ require_once __DIR__ . '/includes/binding.php';
 require_once __DIR__ . '/includes/binding-code.php';
 require_once __DIR__ . '/includes/business.php';
 require_once __DIR__ . '/includes/checkin.php';
+require_once __DIR__ . '/includes/points.php';
 
 register_activation_hook(__FILE__, __NAMESPACE__ . '\\install');
 add_action('plugins_loaded', __NAMESPACE__ . '\\maybe_install');
@@ -78,15 +79,16 @@ function install()
         KEY expires_at (expires_at)
     ) $collate;");
     install_binding_codes($collate);
+    install_points($collate);
     add_option(OPTION, settings(), '', false);
-    if (binding_schema_ready()) {
-        update_option('astrbot_zibll_schema', 'binding_codes', false);
+    if (binding_schema_ready() && points_schema_ready()) {
+        update_option('astrbot_zibll_schema', 'points_v1', false);
     }
 }
 
 function maybe_install()
 {
-    if (get_option('astrbot_zibll_schema') !== 'binding_codes') {
+    if (get_option('astrbot_zibll_schema') !== 'points_v1') {
         install();
     }
 }
@@ -116,7 +118,7 @@ function theme_status()
 {
     $required = array(
         '_pz', 'zib_get_user_avatar_url', 'zib_get_user_post_count',
-        'get_user_comment_count', 'zibpay_get_user_points', 'zib_user_checkin',
+        'get_user_comment_count', 'zibpay_get_user_points', 'zibpay_update_user_points', 'zib_user_checkin',
         'zib_get_user_the_checkin_details', 'zib_get_user_checkin_all_day',
         'zib_get_user_checkin_continuous_day',
         'zibpay_user_is_allow_add_free_points', 'zib_user_is_allow_add_integral',
@@ -141,6 +143,7 @@ function capabilities()
     if (!$theme['ready']) {
         return failure('unavailable', 503);
     }
+    $points_available = $theme['points_enabled'] && points_schema_ready() && points_transactions_ready();
     return new \WP_REST_Response(array(
         'request_id' => wp_generate_uuid4(),
         'code' => 'ok',
@@ -151,6 +154,10 @@ function capabilities()
             'timezone' => wp_timezone_string(),
             'actions' => array_merge(array('capabilities'), business_routes()),
             'binding_code' => binding_schema_ready() && binding_transactions_ready(),
+            'points_management' => $points_available,
+            'points_actions' => $points_available
+                ? array('points/add', 'points/subtract', 'points/status') : array(),
+            'points_max_amount' => POINTS_MAX_AMOUNT,
             'management_url' => add_query_arg('az_bindings', '1', home_url('/')),
             'theme' => $theme,
         ),

@@ -119,14 +119,21 @@ class ConfigurationTests(unittest.TestCase):
         settings = Settings.from_config(config())
         self.assertNotIn(TEST_SECRET, repr(settings))
         self.assertEqual(settings.timeout, 15)
+        self.assertEqual(settings.points_operator_ids, frozenset())
         for key, value in (
             ("shared_secret", "bad"), ("shared_secret", TEST_SECRET.upper()),
             ("request_timeout", True), ("request_timeout", 31), ("client_id", "a\nb"),
             ("key_id", ""), ("api_base_url", "https://example.com"),
-            ("allow_local_http", "true"),
+            ("allow_local_http", "true"), ("points_operator_ids", ["a b"]),
         ):
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 Settings.from_config({**config(), key: value})
+        self.assertEqual(
+            Settings.from_config({
+                **config(), "points_operator_ids": ["qq-openid", "123456"],
+            }).points_operator_ids,
+            frozenset({"qq-openid", "123456"}),
+        )
 
     def test_cross_language_signature_vector(self):
         actual = sign_request(
@@ -142,6 +149,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse(schema["enabled"]["default"])
         self.assertTrue(schema["shared_secret"]["secret"])
         self.assertEqual(schema["allowed_groups"]["default"], [])
+        self.assertEqual(schema["points_operator_ids"]["default"], [])
         self.assertEqual(
             {key: value["default"] for key, value in schema["commands"]["items"].items()},
             DEFAULT_COMMANDS,

@@ -109,6 +109,298 @@ class CodeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(self.actor, self.client.pending_bindings)
 
 
+class PointsServiceTests(unittest.IsolatedAsyncioTestCase):
+    asyncTearDown = foundations.ClientTests.asyncTearDown
+
+    async def asyncSetUp(self):
+        await foundations.ClientTests.asyncSetUp(self)
+        self.actor = Actor("onebot-instance", "001", "group-1", "admin-1")
+        self.event = StubEvent()
+        self.event.message_obj = types.SimpleNamespace(
+            message_id="points-1", timestamp=int(time.time()),
+        )
+        self.client.points_management_available = True
+
+    def match(self, action="points_add", argument="50", target_id="member-1"):
+        return CommandMatch(action, argument, target_id)
+
+    def completed(self, action="points_add", amount=50, before=100, after=150):
+        return {
+            "state": "completed",
+            "request_id": event_identity(self.event, self.actor, "points")["request_id"],
+            "action": "add" if action == "points_add" else "subtract",
+            "uid": 42,
+            "nickname": "Member",
+            "amount": amount,
+            "points_before": before,
+            "points_after": after,
+        }
+
+    async def test_success_uses_target_actor_and_returns_balance(self):
+        self.client.request = AsyncMock(return_value=self.completed())
+        text, image = await execute(
+            self.client, self.match(), self.actor, self.event,
+        )
+        self.assertIsNone(image)
+        self.assertIn("加积分完成：Member（UID：42）", text)
+        self.assertIn("当前积分：150", text)
+        route, body = self.client.request.call_args.args
+        self.assertEqual(route, "/points/add")
+        self.assertEqual(body["amount"], 50)
+        self.assertEqual(body["target_actor"]["sender_id"], "member-1")
+        self.assertNotIn("uid", body)
+
+    async def test_amount_validation_rejects_zero_leading_zero_and_over_limit(self):
+        for argument in ("0", "01", "100001", "not-a-number"):
+            with self.subTest(argument=argument):
+                self.client.request = AsyncMock()
+                with self.assertRaises(BridgeError) as caught:
+                    await execute(
+                        self.client, self.match(argument=argument),
+                        self.actor, self.event,
+                    )
+                self.assertEqual(caught.exception.code, "invalid_parameters")
+                self.client.request.assert_not_awaited()
+
+    async def test_network_error_only_queries_status(self):
+        self.client.request = AsyncMock(side_effect=[
+            BridgeError("network_error"),
+            self.completed("points_subtract", before=200, after=150),
+        ])
+        text, _ = await execute(
+            self.client, self.match("points_subtract"), self.actor, self.event,
+        )
+        self.assertIn("减积分完成", text)
+        self.assertEqual(
+            [call.args[0] for call in self.client.request.await_args_list],
+            ["/points/subtract", "/points/status"],
+        )
+        self.assertNotIn(
+            "target_actor", self.client.request.await_args_list[1].args[1],
+        )
+
+    async def test_uncertain_error_queries_status_without_replaying_operation(self):
+        self.client.request = AsyncMock(side_effect=[
+            BridgeError("uncertain"),
+            self.completed(),
+        ])
+        text, _ = await execute(
+            self.client, self.match(), self.actor, self.event,
+        )
+        self.assertIn("加积分完成", text)
+        self.assertEqual(
+            [call.args[0] for call in self.client.request.await_args_list],
+            ["/points/add", "/points/status"],
+        )
+
+    async def test_pending_and_uncertain_states_query_status_without_replay(self):
+        for state in ("pending", "uncertain"):
+            with self.subTest(state=state):
+                self.client.request = AsyncMock(side_effect=[
+                    {"state": state},
+                    {"state": state},
+                ])
+                text, _ = await execute(
+                    self.client, self.match(), self.actor, self.event,
+                )
+                self.assertIn("结果需要核实", text)
+                self.assertEqual(
+                    [call.args[0] for call in self.client.request.await_args_list],
+                    ["/points/add", "/points/status"],
+                )
+
+    async def test_request_identity_is_stable_when_operation_input_changes(self):
+        first_id = event_identity(self.event, self.actor, "points")["request_id"]
+        for match in (
+            self.match("points_add", "50", "member-1"),
+            self.match("points_add", "75", "member-1"),
+            self.match("points_subtract", "50", "member-1"),
+            self.match("points_add", "50", "member-2"),
+        ):
+            self.client.request = AsyncMock(return_value={
+                "state": "not_started", "request_id": first_id,
+            })
+            await execute(self.client, match, self.actor, self.event)
+            self.assertEqual(
+                self.client.request.call_args.args[1]["request_id"], first_id,
+            )
+
+    async def test_completed_response_must_match_request_and_balance_delta(self):
+        invalid = (
+            {**self.completed(), "request_id": "a" * 64},
+            {**self.completed(), "action": "subtract"},
+            {**self.completed(), "points_after": 149},
+            {**self.completed(), "points_before": -1},
+        )
+        for response in invalid:
+            with self.subTest(response=response):
+                self.client.request = AsyncMock(return_value=response)
+                with self.assertRaises(BridgeError) as caught:
+                    await execute(self.client, self.match(), self.actor, self.event)
+                self.assertEqual(caught.exception.code, "invalid_response")
+
+    async def test_missing_status_record_is_not_retried(self):
+        self.client.request = AsyncMock(side_effect=[
+            BridgeError("network_error"),
+            {"state": "not_started", "request_id": "a" * 64},
+        ])
+        text, _ = await execute(
+            self.client, self.match(), self.actor, self.event,
+        )
+        self.assertIn("尚未查到本次积分操作记录", text)
+        self.assertEqual(self.client.request.await_count, 2)
+
+    async def test_rejected_site_result_is_preserved(self):
+        self.client.request = AsyncMock(return_value={
+            "state": "rejected", "error_code": "insufficient_points",
+        })
+        with self.assertRaises(BridgeError) as caught:
+            await execute(
+                self.client, self.match("points_subtract"),
+                self.actor, self.event,
+            )
+        self.assertEqual(caught.exception.code, "insufficient_points")
+
+
+class PointsFilterTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.module = load_main_with_framework_stubs()
+        plugin_config = {**config(), "points_operator_ids": ["user-1"]}
+        self.plugin = self.module.ZibllPlugin(object(), plugin_config)
+        self.plugin.connected = True
+        self.plugin.client.points_management_available = True
+        self.module.ScopedCommandFilter.points_ready = True
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+
+    def event(self, target_ids=("member-1",), text="/加积分 50"):
+        event = StubEvent()
+        event.messages = [At("001"), Plain(text)]
+        event.messages.extend(At(value) for value in target_ids)
+        event.message_obj = types.SimpleNamespace(
+            message_id="points-filter-1", timestamp=int(time.time()),
+        )
+        return event
+
+    async def use_qq_official(self):
+        await self.plugin.terminate()
+        self.plugin = self.module.ZibllPlugin(object(), {
+            **config(),
+            "allowed_groups": ["qq-instance|qq_official|group-1"],
+            "points_operator_ids": ["user-1"],
+        })
+        self.plugin.connected = True
+        self.plugin.client.points_management_available = True
+        self.module.ScopedCommandFilter.points_ready = True
+
+    def qq_event(self, text, mentions):
+        event = self.event((), text)
+        event.platform_name = "qq_official"
+        event.platform = "qq-instance"
+        event.bot = "qq_official"
+        event.messages = [At("qq_official"), Plain(text)]
+        event.message_obj.raw_message = types.SimpleNamespace(
+            mentions=[types.SimpleNamespace(id=value) for value in mentions],
+        )
+        return event
+
+    def test_points_command_requires_one_target_and_capability(self):
+        match = self.module.ScopedCommandFilter.match(self.event())
+        self.assertEqual(match.action, "points_add")
+        self.assertEqual(match.argument, "50")
+        self.assertEqual(match.target_id, "member-1")
+        multiple_targets = self.module.ScopedCommandFilter.match(
+            self.event(("member-1", "member-2")),
+        )
+        self.assertEqual(multiple_targets.action, "points_add")
+        self.assertIsNone(multiple_targets.target_id)
+        self.module.ScopedCommandFilter.points_ready = False
+        match = self.module.ScopedCommandFilter.match(self.event())
+        self.assertEqual(match.action, "points_add")
+        self.assertEqual(match.target_id, "member-1")
+
+    async def test_multiple_and_duplicate_targets_only_return_usage(self):
+        for target_ids in (("member-1", "member-2"), ("member-1", "member-1")):
+            with self.subTest(target_ids=target_ids):
+                event = self.event(target_ids)
+                self.plugin.client.request = AsyncMock()
+                results = [result async for result in self.plugin.website_command(event)]
+                self.assertEqual(len(results), 1)
+                self.assertIn("用法：/加积分 正整数 @群成员", results[0].text)
+                self.plugin.client.request.assert_not_awaited()
+
+    async def test_plain_text_mention_cannot_select_target(self):
+        event = self.event((), "/加积分 50 <@member-1>")
+        self.plugin.client.request = AsyncMock()
+        results = [result async for result in self.plugin.website_command(event)]
+        self.assertEqual(len(results), 1)
+        self.assertIn("用法：/加积分 正整数 @群成员", results[0].text)
+        self.plugin.client.request.assert_not_awaited()
+
+    async def test_qq_official_target_must_match_structured_mention(self):
+        await self.use_qq_official()
+        event = self.qq_event("/加积分 50 <@!member-openid>", ["qq_official", "member-openid"])
+        match = self.module.ScopedCommandFilter.match(event)
+        self.assertEqual(match.action, "points_add")
+        self.assertEqual(match.target_id, "member-openid")
+
+        for text, mentions in (
+            ("/加积分 50 <@!member-openid>", ["qq_official", "different-openid"]),
+            ("/加积分 50", ["qq_official", "member-openid"]),
+            ("/加积分 50 <@!member-openid> <@!member-openid>", ["qq_official", "member-openid"]),
+        ):
+            with self.subTest(text=text, mentions=mentions):
+                event = self.qq_event(text, mentions)
+                self.plugin.client.request = AsyncMock()
+                results = [result async for result in self.plugin.website_command(event)]
+                self.assertEqual(len(results), 1)
+                self.assertIn("用法：/加积分 正整数 @群成员", results[0].text)
+                self.plugin.client.request.assert_not_awaited()
+
+    async def test_non_admin_is_rejected_before_site_request(self):
+        event = self.event()
+        event.sender = "other-user"
+        self.plugin.client.request = AsyncMock()
+        results = [result async for result in self.plugin.website_command(event)]
+        self.assertEqual(len(results), 1)
+        self.assertIn("积分操作员", results[0].text)
+        self.plugin.client.request.assert_not_awaited()
+
+    async def test_admin_can_execute_targeted_command(self):
+        event = self.event()
+        event.admin = False
+        actor = Actor("onebot-instance", "001", "group-1", "user-1")
+        request_id = event_identity(event, actor, "points")["request_id"]
+        self.plugin.client.request = AsyncMock(return_value={
+            "state": "completed", "uid": 42, "nickname": "Member",
+            "amount": 50, "points_before": 100, "points_after": 150,
+            "request_id": request_id, "action": "add",
+        })
+        results = [result async for result in self.plugin.website_command(event)]
+        self.assertEqual(len(results), 1)
+        self.assertIn("加积分完成", results[0].text)
+        body = self.plugin.client.request.call_args.args[1]
+        self.assertEqual(body["target_actor"]["sender_id"], "member-1")
+
+    async def test_missing_target_is_rejected_without_site_request(self):
+        event = self.event(())
+        self.plugin.client.request = AsyncMock()
+        results = [result async for result in self.plugin.website_command(event)]
+        self.assertEqual(len(results), 1)
+        self.assertIn("用法：/加积分 正整数 @群成员", results[0].text)
+        self.plugin.client.request.assert_not_awaited()
+
+    async def test_capability_unavailable_is_rejected_without_site_request(self):
+        event = self.event()
+        self.plugin.client.points_management_available = False
+        self.plugin.client.request = AsyncMock()
+        results = [result async for result in self.plugin.website_command(event)]
+        self.assertEqual(len(results), 1)
+        self.assertIn("积分管理功能当前不可用", results[0].text)
+        self.plugin.client.request.assert_not_awaited()
+
+
 class CodeFilterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.module = load_main_with_framework_stubs()
