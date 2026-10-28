@@ -3,7 +3,7 @@
  * Plugin Name: AstrBot Zibll Bridge
  * Plugin URI: https://moxacg.moe/
  * Description: AstrBot 与 Zibll 的账号授权、本人资料、签到及公开文章桥接。
- * Version: 0.0.2
+ * Version: 0.0.3
  * Author: moxacg
  * Author URI: https://moxacg.moe/
  * Requires PHP: 8.0
@@ -20,6 +20,7 @@ require_once __DIR__ . '/includes/binding-code.php';
 require_once __DIR__ . '/includes/business.php';
 require_once __DIR__ . '/includes/checkin.php';
 require_once __DIR__ . '/includes/points.php';
+require_once __DIR__ . '/includes/blindbox.php';
 
 register_activation_hook(__FILE__, __NAMESPACE__ . '\\install');
 add_action('plugins_loaded', __NAMESPACE__ . '\\maybe_install');
@@ -80,6 +81,7 @@ function install()
     ) $collate;");
     install_binding_codes($collate);
     install_points($collate);
+    install_blindbox($collate);
     add_option(OPTION, settings(), '', false);
     if (binding_schema_ready() && points_schema_ready()) {
         update_option('astrbot_zibll_schema', 'points_v1', false);
@@ -90,6 +92,16 @@ function maybe_install()
 {
     if (get_option('astrbot_zibll_schema') !== 'points_v1') {
         install();
+    }
+    if (get_option('astrbot_zibll_blindbox_schema') !== 'blindbox_v1'
+        || !blindbox_schema_ready()
+    ) {
+        global $wpdb;
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        install_blindbox($wpdb->get_charset_collate());
+        if (blindbox_schema_ready()) {
+            update_option('astrbot_zibll_blindbox_schema', 'blindbox_v1', false);
+        }
     }
 }
 
@@ -144,6 +156,7 @@ function capabilities()
         return failure('unavailable', 503);
     }
     $points_available = $theme['points_enabled'] && points_schema_ready() && points_transactions_ready();
+    $blindbox_ready = blindbox_schema_ready() && blindbox_transactions_ready();
     return new \WP_REST_Response(array(
         'request_id' => wp_generate_uuid4(),
         'code' => 'ok',
@@ -158,6 +171,9 @@ function capabilities()
             'points_actions' => $points_available
                 ? array('points/add', 'points/subtract', 'points/status') : array(),
             'points_max_amount' => POINTS_MAX_AMOUNT,
+            'blindbox' => $blindbox_ready,
+            'blindbox_actions' => $blindbox_ready
+                ? array('blindbox/open', 'blindbox/exchange', 'blindbox/status') : array(),
             'management_url' => add_query_arg('az_bindings', '1', home_url('/')),
             'theme' => $theme,
         ),

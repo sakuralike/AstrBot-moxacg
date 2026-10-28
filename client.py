@@ -151,6 +151,7 @@ class BridgeClient:
         self._closed = False
         self.binding_code_available = False
         self.points_management_available = False
+        self.blindbox_available = False
         self.pending_bindings = {}
 
     async def request(self, path: str, payload: dict | None = None) -> dict:
@@ -214,7 +215,9 @@ class BridgeClient:
                         "code_invalid", "session_expired", "too_many_attempts",
                         "admin_required", "target_not_bound", "points_disabled",
                         "insufficient_points", "points_busy", "points_uncertain",
-                        "points_update_failed", "uncertain",
+                        "points_update_failed", "uncertain", "blindbox_disabled",
+                        "blindbox_config_invalid", "blindbox_no_chances",
+                        "blindbox_exchange_limit", "blindbox_unresolved",
                     }:
                         code = payload["code"]
                     raise BridgeError(code)
@@ -232,6 +235,7 @@ class BridgeClient:
     async def capabilities(self) -> dict:
         self.binding_code_available = False
         self.points_management_available = False
+        self.blindbox_available = False
         data = await self.request("/capabilities")
         if data.get("protocol") != PROTOCOL:
             raise BridgeError("protocol_mismatch")
@@ -255,12 +259,20 @@ class BridgeClient:
                 "points/add", "points/subtract", "points/status",
             ))
         )
+        self.blindbox_available = (
+            data.get("blindbox") is True
+            and isinstance(actions, list)
+            and all(action in actions for action in (
+                "blindbox/open", "blindbox/exchange", "blindbox/status",
+            ))
+        )
         return data
 
     async def close(self):
         self._closed = True
         self.binding_code_available = False
         self.points_management_available = False
+        self.blindbox_available = False
         self.pending_bindings.clear()
         if self._session is not None:
             await self._session.close()

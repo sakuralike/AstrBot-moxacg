@@ -198,7 +198,9 @@
       "latest": {"type": "string", "description": "最新文章", "default": "/网站最新"},
       "search": {"type": "string", "description": "文章搜索", "default": "/网站搜索"},
       "points_add": {"type": "string", "description": "管理员给群成员加积分", "default": "/加积分"},
-      "points_subtract": {"type": "string", "description": "管理员给群成员减积分", "default": "/减积分"}
+      "points_subtract": {"type": "string", "description": "管理员给群成员减积分", "default": "/减积分"},
+      "blindbox_open": {"type": "string", "description": "开启盲盒", "default": "/开盲盒"},
+      "blindbox_exchange": {"type": "string", "description": "兑换盲盒次数", "default": "/兑换次数"}
     }
   }
 }

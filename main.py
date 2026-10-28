@@ -42,8 +42,10 @@ MENTION_ID_PATTERNS = (
     re.compile(r'<qqbot-at-user\s+id=["\']([^"\']+)["\']'),
 )
 POINT_ACTIONS = frozenset({"points_add", "points_subtract"})
+BLINDBOX_ACTIONS = frozenset({"blindbox_open", "blindbox_exchange"})
 POINTS_OPERATOR_REQUIRED = "未配置为积分操作员，无法执行积分操作。"
 POINTS_UNAVAILABLE = "网站积分管理功能当前不可用，请检查网站桥接插件和积分设置。"
+BLINDBOX_UNAVAILABLE = "网站盲盒功能当前不可用，请管理员更新网站桥接插件并检查配置。"
 
 
 def _probe_id(value: object) -> dict:
@@ -367,6 +369,7 @@ class ScopedCommandFilter(filter.CustomFilter):
     processed = {}
     code_ready = False
     points_ready = False
+    blindbox_ready = False
 
     @classmethod
     def match(cls, event: AstrMessageEvent) -> CommandMatch | None:
@@ -473,6 +476,7 @@ class ZibllPlugin(Star):
         ScopedCommandFilter.processed = {}
         ScopedCommandFilter.code_ready = False
         ScopedCommandFilter.points_ready = False
+        ScopedCommandFilter.blindbox_ready = False
         ScopedBalanceFilter.settings = None
         ScopedUsageFilter.settings = None
         if config.get("balance_enabled", False) is True:
@@ -519,6 +523,7 @@ class ZibllPlugin(Star):
         if ScopedCommandFilter.settings is self.settings:
             ScopedCommandFilter.code_ready = False
             ScopedCommandFilter.points_ready = False
+            ScopedCommandFilter.blindbox_ready = False
         if self.client is None or self._terminated:
             return
         try:
@@ -530,6 +535,7 @@ class ZibllPlugin(Star):
             self.connected = True
             ScopedCommandFilter.code_ready = self.client.binding_code_available
             ScopedCommandFilter.points_ready = self.client.points_management_available
+            ScopedCommandFilter.blindbox_ready = self.client.blindbox_available
             logger.info("AstrBot-Zibll 认证连通验证通过。")
 
     @filter.custom_filter(ScopedBalanceFilter, priority=100)
@@ -647,10 +653,19 @@ class ZibllPlugin(Star):
                 "目标群员再单独发送 @机器人 /适配器核查，对照两条日志中的 ID 哈希。"
             ).use_markdown(False).stop_event()
             return
+        if match.action in BLINDBOX_ACTIONS and match.argument:
+            command = self.settings.router.commands[match.action]
+            yield event.plain_result(
+                f"用法：{command}（不带参数，每次操作 1 次）"
+            ).use_markdown(False).stop_event()
+            return
         if not self.connected:
             yield event.plain_result(
                 "网站连接尚未通过验证，请管理员检查配置并重载插件。"
             ).use_markdown(False).stop_event()
+            return
+        if match.action in BLINDBOX_ACTIONS and not self.client.blindbox_available:
+            yield event.plain_result(BLINDBOX_UNAVAILABLE).use_markdown(False).stop_event()
             return
         if match.action in POINT_ACTIONS:
             actor = event_actor(event, self.settings)
@@ -746,6 +761,7 @@ class ZibllPlugin(Star):
             ScopedCommandFilter.processed = {}
             ScopedCommandFilter.code_ready = False
             ScopedCommandFilter.points_ready = False
+            ScopedCommandFilter.blindbox_ready = False
         self._processed.clear()
         self.connected = False
         if self.client is not None:

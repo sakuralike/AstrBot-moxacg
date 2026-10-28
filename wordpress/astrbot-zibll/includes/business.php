@@ -11,6 +11,7 @@ function business_routes()
         'binding/code/start', 'binding/code/redeem', 'binding/code/status',
         'profile', 'checkin', 'checkin/status', 'articles/latest', 'articles/search',
         'points/add', 'points/subtract', 'points/status',
+        'blindbox/open', 'blindbox/exchange', 'blindbox/status',
     );
 }
 
@@ -36,6 +37,9 @@ function dispatch_business($request)
     }
     if (str_starts_with($action, 'points/')) {
         return points_action($action, $actor, $input);
+    }
+    if (str_starts_with($action, 'blindbox/')) {
+        return blindbox_action($action, $actor, $input);
     }
     return with_lock('actor:' . $actor['actor_hash'], static function () use ($action, $actor, $input) {
         $user = bound_user($actor['actor_hash']);

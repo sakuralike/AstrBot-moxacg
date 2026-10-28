@@ -22,6 +22,73 @@ function admin_headers()
     header('Referrer-Policy: no-referrer');
 }
 
+function blindbox_admin_prize_row($index, $prize)
+{
+    $field_index = is_string($index) ? $index : (string) (int) $index;
+    $type = $prize['type'] ?? 'points';
+    $points = $type === 'points';
+    echo '<tr class="az-blindbox-prize">';
+    echo '<td><input class="regular-text" name="blindbox_prizes[' . esc_attr($field_index) . '][id]" value="'
+        . esc_attr($prize['id'] ?? '') . '" maxlength="64" required></td>';
+    echo '<td><input class="regular-text" name="blindbox_prizes[' . esc_attr($field_index) . '][name]" value="'
+        . esc_attr($prize['name'] ?? '') . '" maxlength="40" required></td>';
+    echo '<td><select class="az-blindbox-type" name="blindbox_prizes[' . esc_attr($field_index) . '][type]">';
+    foreach (array('points' => '积分', 'text' => '文本') as $value => $label) {
+        echo '<option value="' . esc_attr($value) . '"' . selected($type, $value, false) . '>'
+            . esc_html($label) . '</option>';
+    }
+    echo '</select></td>';
+    echo '<td><input type="number" name="blindbox_prizes[' . esc_attr($field_index) . '][probability]" value="'
+        . esc_attr($prize['probability'] ?? '100') . '" min="0" max="100" step="0.01" required></td>';
+    echo '<td><div class="az-blindbox-points"' . ($points ? '' : ' hidden') . '>';
+    echo '<input type="number" name="blindbox_prizes[' . esc_attr($field_index) . '][points_min]" value="'
+        . esc_attr($prize['points_min'] ?? 50) . '" min="1" max="100000">'
+        . ' 至 <input type="number" name="blindbox_prizes[' . esc_attr($field_index) . '][points_max]" value="'
+        . esc_attr($prize['points_max'] ?? 300) . '" min="1" max="100000"> 积分</div></td>';
+    echo '<td><div class="az-blindbox-text"' . (!$points ? '' : ' hidden') . '>';
+    echo '<textarea name="blindbox_prizes[' . esc_attr($field_index) . '][text]" maxlength="500" rows="2">'
+        . esc_textarea($prize['text'] ?? '') . '</textarea></div></td>';
+    echo '<td><button type="button" class="button az-blindbox-remove">删除</button></td>';
+    echo '</tr>';
+}
+
+function render_blindbox_settings($config)
+{
+    $prizes = is_array($config['prizes'] ?? null) ? $config['prizes'] : array();
+    if (!$prizes) {
+        $prizes = array(array(
+            'id' => 'points_default', 'name' => '积分盲盒', 'type' => 'points',
+            'probability' => '100', 'points_min' => 50, 'points_max' => 300,
+        ));
+    }
+    echo '<input type="hidden" name="blindbox_present" value="1">';
+    echo '<h2>盲盒设置</h2>';
+    echo '<p>积分奖励使用 Zibll 积分；兑换次数当日有效，先使用免费次数。积分奖和文本奖均消耗一次开盒次数。</p>';
+    echo '<p><label><input type="checkbox" name="blindbox_enabled" value="1" '
+        . checked(($config['enabled'] ?? false) === true, true, false) . '>开启盲盒</label></p>';
+    echo '<p><label>每日免费开盒次数 <input type="number" name="blindbox_daily_free_limit" min="0" max="1000" step="1" value="'
+        . (int) ($config['daily_free_limit'] ?? 5) . '"></label> ';
+    echo '<label>每日兑换次数上限 <input type="number" name="blindbox_daily_exchange_limit" min="0" max="1000" step="1" value="'
+        . (int) ($config['daily_exchange_limit'] ?? 5) . '"></label> ';
+    echo '<label>每次兑换积分 <input type="number" name="blindbox_exchange_cost_points" min="1" max="100000" step="1" value="'
+        . (int) ($config['exchange_cost_points'] ?? 25) . '"></label></p>';
+    echo '<table class="widefat striped"><thead><tr><th>奖项 ID</th><th>名称</th><th>类型</th><th>概率（%）</th>'
+        . '<th>积分范围</th><th>文本内容</th><th></th></tr></thead><tbody id="az-blindbox-prizes">';
+    foreach (array_values($prizes) as $index => $prize) {
+        blindbox_admin_prize_row($index, $prize);
+    }
+    echo '</tbody></table><p>概率合计：<strong id="az-blindbox-total">0%</strong>（必须为 100%）</p>';
+    echo '<p><button type="button" class="button" id="az-blindbox-add">添加奖项</button></p>';
+    echo '<template id="az-blindbox-prize-template">';
+    blindbox_admin_prize_row('__INDEX__', array(
+        'id' => '', 'name' => '', 'type' => 'points', 'probability' => '0',
+        'points_min' => 50, 'points_max' => 300, 'text' => '',
+    ));
+    echo '</template>';
+    echo '<script src="' . esc_url(plugins_url('../assets/blindbox-admin.js', __FILE__))
+        . '" defer></script>';
+}
+
 function parse_groups($text)
 {
     if (!is_string($text) || strlen($text) > 40000) {
@@ -94,6 +161,20 @@ function save_settings($input)
         $options['enabled'] = $enabled;
         $options['allowed_groups'] = $groups;
         $options['allow_local_http'] = ($input['allow_local_http'] ?? '') === '1';
+        if (($input['blindbox_present'] ?? '') === '1') {
+            $raw_blindbox = array(
+                'enabled' => ($input['blindbox_enabled'] ?? '') === '1',
+                'daily_free_limit' => $input['blindbox_daily_free_limit'] ?? null,
+                'daily_exchange_limit' => $input['blindbox_daily_exchange_limit'] ?? null,
+                'exchange_cost_points' => $input['blindbox_exchange_cost_points'] ?? null,
+                'prizes' => $input['blindbox_prizes'] ?? null,
+            );
+            $blindbox = blindbox_validate_config($raw_blindbox);
+            if (is_wp_error($blindbox)) {
+                return $blindbox;
+            }
+            $options['blindbox'] = $blindbox;
+        }
     } elseif ($action === 'rotate') {
         if (!$options['client_id']) {
             $options['client_id'] = 'az_' . bin2hex(random_bytes(16));
@@ -164,6 +245,7 @@ function admin_page()
     echo '<p><label><input type="checkbox" name="allow_local_http" value="1" '
         . checked($options['allow_local_http'], true, false)
         . '>允许本机 HTTP 调试（公开网站与请求主机都须为环回地址）</label></p>';
+    render_blindbox_settings($options['blindbox']);
     echo '<h2>绑定页面外观</h2>';
     echo '<p><label for="az-background-color">背景色</label> '
         . '<input type="color" id="az-background-color" name="binding_background_color" value="'

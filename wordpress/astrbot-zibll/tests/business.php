@@ -18,7 +18,7 @@ $_SERVER['HTTPS'] = 'on';
 $_SERVER['REQUEST_METHOD'] = 'GET';
 $_SERVER['REQUEST_URI'] = '/';
 
-if (!in_array($argv[1] ?? '', array('--run', '--checkin-worker', '--page-worker', '--code-worker', '--points-worker'), true)) {
+if (!in_array($argv[1] ?? '', array('--run', '--checkin-worker', '--page-worker', '--code-worker', '--points-worker', '--blindbox-worker'), true)) {
     define('SHORTINIT', true);
     require ABSPATH . 'wp-load.php';
     $prefix = 'azb_' . bin2hex(random_bytes(6)) . '_';
@@ -155,6 +155,18 @@ function spawn_points_worker($table_prefix, $target_sender, $request_label, $amo
     return array($process, $pipes);
 }
 
+function spawn_blindbox_worker($table_prefix, $actor, $route, $request_label, $start)
+{
+    $payload = base64_encode(wp_json_encode(array(
+        'actor' => $actor, 'route' => $route, 'request_id' => hash('sha256', $request_label),
+    )));
+    $process = proc_open(array(
+        PHP_BINARY, __FILE__, '--blindbox-worker', $table_prefix, $payload, (string) $start,
+    ), array(0 => array('pipe', 'r'), 1 => array('pipe', 'w'), 2 => array('pipe', 'w')), $pipes);
+    fclose($pipes[0]);
+    return array($process, $pipes);
+}
+
 function clear_fixture_limits()
 {
     global $wpdb;
@@ -203,6 +215,21 @@ if ($argv[1] === '--points-worker') {
     $response = call_api('points/add', array(
         'platform_id' => 'p', 'bot_self_id' => 'bot', 'group_id' => 'g', 'sender_id' => '001',
     ), array_merge(array('target_actor' => $target, 'amount' => (int) $argv[5]), $event));
+    $data = $response->get_data();
+    echo wp_json_encode(array('status' => $response->get_status(), 'data' => $data['data'] ?? null, 'code' => $data['code'] ?? null));
+    exit;
+}
+
+if ($argv[1] === '--blindbox-worker') {
+    $payload = json_decode(base64_decode($argv[3]), true);
+    while (microtime(true) < (float) $argv[4]) {
+        usleep(1000);
+    }
+    $GLOBALS['wp_rest_server'] = new WP_REST_Server();
+    do_action('rest_api_init');
+    $response = call_api($payload['route'], $payload['actor'], array(
+        'request_id' => $payload['request_id'], 'event_time' => time(),
+    ));
     $data = $response->get_data();
     echo wp_json_encode(array('status' => $response->get_status(), 'data' => $data['data'] ?? null, 'code' => $data['code'] ?? null));
     exit;
@@ -359,6 +386,7 @@ $points_cross_group = call_api('points/add', array_merge($actor, array('group_id
 verify($points_cross_group->get_status() === 403 && $points_cross_group->get_data()['code'] === 'forbidden'
     && zibpay_get_user_points($points_uid) === 30, 'Cross-group points target is rejected');
 
+clear_fixture_limits();
 $start = microtime(true) + 3;
 $workers = array(
     spawn_points_worker($table_prefix, '003', 'points-concurrent-same', 13, $start),
@@ -385,6 +413,7 @@ verify(zibpay_get_user_points($points_uid) === 43
     && $points_record_has($points_uid, 'astrbot:' . substr($duplicate_key, 0, 24), 13, 43),
     'Concurrent duplicate points calls apply exactly once with a matching ledger entry');
 
+clear_fixture_limits();
 $start = microtime(true) + 3;
 $workers = array(
     spawn_points_worker($table_prefix, '003', 'points-concurrent-a', 7, $start),
@@ -409,6 +438,474 @@ verify($completed_points_workers === 2,
 AstrBotZibll\fresh_user_meta($points_uid);
 verify(zibpay_get_user_points($points_uid) === 61,
     'Concurrent distinct points operations preserve both balance updates');
+
+$blindbox_options = AstrBotZibll\settings();
+$blindbox_config = AstrBotZibll\blindbox_default_config();
+$blindbox_config['enabled'] = true;
+$blindbox_config['prizes'] = array(array(
+    'id' => 'fixed_points', 'name' => '固定积分奖', 'type' => 'points',
+    'probability' => '100.00', 'probability_bp' => 10000,
+    'points_min' => 50, 'points_max' => 50,
+));
+$blindbox_options['blindbox'] = $blindbox_config;
+update_option(AstrBotZibll\OPTION, $blindbox_options, false);
+$blindbox_actor = $points_target_actor;
+$blindbox_open_event = array(
+    'request_id' => hash('sha256', 'blindbox-open-idempotent'),
+    'event_time' => time(),
+);
+$blindbox_points_before = zibpay_get_user_points($points_uid);
+clear_fixture_limits();
+$blindbox_opened = call_api('blindbox/open', $blindbox_actor, $blindbox_open_event);
+$blindbox_open_data = $blindbox_opened->get_data()['data'];
+verify($blindbox_opened->get_status() === 200
+    && $blindbox_opened->get_data()['code'] === 'ok'
+    && $blindbox_open_data['state'] === 'completed'
+    && $blindbox_open_data['action'] === 'open'
+    && $blindbox_open_data['prize']['points'] === 50
+    && $blindbox_open_data['free_remaining'] === 4
+    && zibpay_get_user_points($points_uid) === $blindbox_points_before + 50,
+    'Blindbox open awards the configured prize and consumes one free chance');
+$blindbox_open_repeat = call_api('blindbox/open', $blindbox_actor, $blindbox_open_event);
+verify($blindbox_open_repeat->get_data()['data']['state'] === 'completed'
+    && zibpay_get_user_points($points_uid) === $blindbox_points_before + 50,
+    'Repeated blindbox open returns its original result without a second award');
+$blindbox_cross_action = call_api('blindbox/exchange', $blindbox_actor, $blindbox_open_event);
+verify($blindbox_cross_action->get_status() === 409
+    && $blindbox_cross_action->get_data()['code'] === 'request_conflict'
+    && zibpay_get_user_points($points_uid) === $blindbox_points_before + 50,
+    'Reusing an open request ID for exchange is rejected');
+$blindbox_config['enabled'] = false;
+$blindbox_options['blindbox'] = $blindbox_config;
+update_option(AstrBotZibll\OPTION, $blindbox_options, false);
+$blindbox_open_replay = call_api('blindbox/open', $blindbox_actor, $blindbox_open_event);
+verify($blindbox_open_replay->get_data()['data']['state'] === 'completed'
+    && zibpay_get_user_points($points_uid) === $blindbox_points_before + 50,
+    'Disabling blindbox does not change the stored result of an existing request');
+
+$blindbox_config['enabled'] = true;
+$blindbox_options['blindbox'] = $blindbox_config;
+update_option(AstrBotZibll\OPTION, $blindbox_options, false);
+$blindbox_exchange_event = array(
+    'request_id' => hash('sha256', 'blindbox-exchange-success'),
+    'event_time' => time(),
+);
+$blindbox_exchange_before = zibpay_get_user_points($points_uid);
+clear_fixture_limits();
+$blindbox_exchanged = call_api('blindbox/exchange', $blindbox_actor, $blindbox_exchange_event);
+$blindbox_exchange_data = $blindbox_exchanged->get_data()['data'];
+verify($blindbox_exchanged->get_status() === 200
+    && $blindbox_exchange_data['state'] === 'completed'
+    && $blindbox_exchange_data['cost_points'] === 25
+    && $blindbox_exchange_data['exchange_bought'] === 1
+    && $blindbox_exchange_data['exchange_remaining'] === 1
+    && zibpay_get_user_points($points_uid) === $blindbox_exchange_before - 25,
+    'Blindbox exchange debits its configured price and grants one same-day chance');
+$blindbox_exchange_repeat = call_api('blindbox/exchange', $blindbox_actor, $blindbox_exchange_event);
+verify($blindbox_exchange_repeat->get_data()['data']['state'] === 'completed'
+    && zibpay_get_user_points($points_uid) === $blindbox_exchange_before - 25,
+    'Repeated blindbox exchange returns its original result without another debit');
+
+$blindbox_config['exchange_cost_points'] = 1000;
+$blindbox_options['blindbox'] = $blindbox_config;
+update_option(AstrBotZibll\OPTION, $blindbox_options, false);
+$blindbox_insufficient_event = array(
+    'request_id' => hash('sha256', 'blindbox-exchange-insufficient'),
+    'event_time' => time(),
+);
+$blindbox_insufficient_before = zibpay_get_user_points($points_uid);
+clear_fixture_limits();
+$blindbox_insufficient = call_api('blindbox/exchange', $blindbox_actor, $blindbox_insufficient_event);
+$blindbox_insufficient_data = $blindbox_insufficient->get_data()['data'];
+verify($blindbox_insufficient->get_status() === 200
+    && $blindbox_insufficient_data['state'] === 'rejected'
+    && $blindbox_insufficient_data['error_code'] === 'insufficient_points'
+    && $blindbox_insufficient_data['cost_points'] === 1000
+    && zibpay_get_user_points($points_uid) === $blindbox_insufficient_before,
+    'Insufficient blindbox exchange points create a terminal rejection without a debit');
+$blindbox_config['exchange_cost_points'] = 25;
+$blindbox_options['blindbox'] = $blindbox_config;
+update_option(AstrBotZibll\OPTION, $blindbox_options, false);
+$blindbox_insufficient_repeat = call_api('blindbox/exchange', $blindbox_actor, $blindbox_insufficient_event);
+verify($blindbox_insufficient_repeat->get_data()['data']['state'] === 'rejected'
+    && $blindbox_insufficient_repeat->get_data()['data']['error_code'] === 'insufficient_points'
+    && zibpay_get_user_points($points_uid) === $blindbox_insufficient_before,
+    'Changing exchange price does not retry a stored insufficient-points rejection');
+
+$blindbox_other_actor = array_merge($blindbox_actor, array('group_id' => 'other'));
+verify(authorize_actor($blindbox_other_actor, $points_uid)->get_status() === 200,
+    'Same website UID can bind an additional allowed group for blindbox');
+$pending_request_id = hash('sha256', 'blindbox-cross-group-pending');
+$pending_actor_data = AstrBotZibll\actor_data_from_array($blindbox_actor);
+$pending_key = AstrBotZibll\blindbox_request_key(
+    $pending_actor_data['actor_hash'], $pending_request_id
+);
+$now = time();
+verify($wpdb->insert(AstrBotZibll\blindbox_operation_table(), array(
+    'request_key' => $pending_key,
+    'request_id' => $pending_request_id,
+    'input_hash' => hash('sha256', 'pending-input'),
+    'actor_hash' => $pending_actor_data['actor_hash'],
+    'user_id' => $points_uid,
+    'site_day' => current_datetime()->format('Y-m-d'),
+    'timezone' => wp_timezone_string(),
+    'action' => 'open',
+    'rule_hash' => hash('sha256', 'pending-rule'),
+    'rule_json' => '{}',
+    'state' => 'pending',
+    'created_at' => $now,
+    'updated_at' => $now,
+    'expires_at' => $now + DAY_IN_SECONDS,
+)) === 1, 'A pending operation is persisted for the first group');
+clear_fixture_limits();
+$blindbox_blocked_event = array(
+    'request_id' => hash('sha256', 'blindbox-cross-group-new'),
+    'event_time' => time(),
+);
+$blindbox_blocked = call_api('blindbox/open', $blindbox_other_actor, $blindbox_blocked_event);
+verify($blindbox_blocked->get_status() === 409
+    && $blindbox_blocked->get_data()['code'] === 'blindbox_unresolved'
+    && zibpay_get_user_points($points_uid) === $blindbox_insufficient_before,
+    'An unresolved operation in one group blocks new blindbox settlement in another');
+$wpdb->delete(AstrBotZibll\blindbox_operation_table(), array('request_key' => $pending_key));
+
+$blindbox_saved_config = $blindbox_config;
+$blindbox_limit_uid = wp_insert_user(array('user_login' => 'fixture-blindbox-limits', 'user_pass' => wp_generate_password()));
+verify(is_int($blindbox_limit_uid), 'Blindbox limits use an independent fixture user');
+$blindbox_limit_actor = array_merge($actor, array('sender_id' => 'blindbox-limits'));
+$blindbox_limit_other = array_merge($blindbox_limit_actor, array('group_id' => 'other'));
+verify(authorize_actor($blindbox_limit_actor, $blindbox_limit_uid)->get_status() === 200
+    && authorize_actor($blindbox_limit_other, $blindbox_limit_uid)->get_status() === 200,
+    'Both groups bind the independent blindbox limit user');
+clear_fixture_limits();
+for ($index = 0; $index < 5; ++$index) {
+    $opened = call_api('blindbox/open', $index % 2 ? $blindbox_limit_other : $blindbox_limit_actor, array(
+        'request_id' => hash('sha256', 'blindbox-free-' . $index), 'event_time' => time(),
+    ))->get_data()['data'];
+    verify($opened['state'] === 'completed' && $opened['use_source'] === 'free'
+        && $opened['free_used'] === $index + 1 && $opened['available'] === 4 - $index,
+        'Free blindbox chances are shared across groups: ' . $index);
+}
+$blindbox_exhausted_event = array(
+    'request_id' => hash('sha256', 'blindbox-free-exhausted'), 'event_time' => time(),
+);
+$blindbox_exhausted = call_api('blindbox/open', $blindbox_limit_actor, $blindbox_exhausted_event);
+$blindbox_exhausted_data = $blindbox_exhausted->get_data()['data'];
+verify($blindbox_exhausted->get_status() === 200
+    && $blindbox_exhausted_data['state'] === 'rejected'
+    && $blindbox_exhausted_data['error_code'] === 'blindbox_no_chances'
+    && $blindbox_exhausted_data['free_used'] === 5 && $blindbox_exhausted_data['available'] === 0
+    && zibpay_get_user_points($blindbox_limit_uid) === 250,
+    'A sixth free blindbox is rejected without granting points or spending another chance');
+
+$blindbox_config['daily_exchange_limit'] = 1;
+$blindbox_config['prizes'] = array(array(
+    'id' => 'text_only', 'name' => 'Text prize', 'type' => 'text',
+    'probability' => '100.00', 'text' => 'A custom prize message',
+));
+$blindbox_options['blindbox'] = $blindbox_config;
+update_option(AstrBotZibll\OPTION, $blindbox_options, false);
+clear_fixture_limits();
+$blindbox_limit_exchange = call_api('blindbox/exchange', $blindbox_limit_other, array(
+    'request_id' => hash('sha256', 'blindbox-limits-exchange'), 'event_time' => time(),
+))->get_data()['data'];
+verify($blindbox_limit_exchange['state'] === 'completed'
+    && $blindbox_limit_exchange['exchange_bought'] === 1 && $blindbox_limit_exchange['available'] === 1
+    && zibpay_get_user_points($blindbox_limit_uid) === 225,
+    'Exhausted free chances can be replenished through the other group');
+$blindbox_exhausted_repeat = call_api('blindbox/open', $blindbox_limit_actor, $blindbox_exhausted_event);
+verify($blindbox_exhausted_repeat->get_data()['data'] === $blindbox_exhausted_data
+    && zibpay_get_user_points($blindbox_limit_uid) === 225,
+    'A rejected open remains rejected after a new chance is purchased');
+$blindbox_text_event = array(
+    'request_id' => hash('sha256', 'blindbox-text-prize'), 'event_time' => time(),
+);
+$blindbox_text_ledger_before = zib_get_user_meta($blindbox_limit_uid, 'points_record', true);
+$blindbox_text = call_api('blindbox/open', $blindbox_limit_actor, $blindbox_text_event)->get_data()['data'];
+verify($blindbox_text['state'] === 'completed' && $blindbox_text['use_source'] === 'exchange'
+    && $blindbox_text['prize']['type'] === 'text'
+    && $blindbox_text['prize']['text'] === 'A custom prize message'
+    && $blindbox_text['points_delta'] === 0 && $blindbox_text['points_after'] === 225
+    && $blindbox_text['free_used'] === 5 && $blindbox_text['exchange_used'] === 1
+    && $blindbox_text['available'] === 0
+    && zibpay_get_user_points($blindbox_limit_uid) === 225
+    && zib_get_user_meta($blindbox_limit_uid, 'points_record', true) === $blindbox_text_ledger_before,
+    'A custom text prize consumes its purchased chance without a points write');
+$blindbox_exchange_capped = call_api('blindbox/exchange', $blindbox_limit_actor, array(
+    'request_id' => hash('sha256', 'blindbox-exchange-capped'), 'event_time' => time(),
+))->get_data()['data'];
+verify($blindbox_exchange_capped['state'] === 'rejected'
+    && $blindbox_exchange_capped['error_code'] === 'blindbox_exchange_limit'
+    && $blindbox_exchange_capped['exchange_bought'] === 1
+    && $blindbox_exchange_capped['exchange_limit'] === 1
+    && zibpay_get_user_points($blindbox_limit_uid) === 225,
+    'Both groups share the exchange limit and rejected exchanges never debit points');
+$blindbox_status = call_api('blindbox/status', $blindbox_limit_actor, array(
+    'request_id' => $blindbox_text_event['request_id'],
+))->get_data()['data'];
+verify($blindbox_status === $blindbox_text
+    && zibpay_get_user_points($blindbox_limit_uid) === 225,
+    'Blindbox status returns the stored result without changing points');
+verify(call_api('blindbox/status', $blindbox_limit_other, array(
+    'request_id' => $blindbox_text_event['request_id'],
+))->get_data()['data']['state'] === 'not_started',
+    'A different group cannot read another actor operation using its request ID');
+$blindbox_limit_hash = AstrBotZibll\actor_data_from_array($blindbox_limit_actor)['actor_hash'];
+verify(!is_wp_error(AstrBotZibll\revoke_binding($blindbox_limit_hash, $blindbox_limit_uid)),
+    'The blindbox fixture binding can be revoked');
+verify(call_api('blindbox/status', $blindbox_limit_actor, array(
+    'request_id' => $blindbox_text_event['request_id'],
+))->get_data()['code'] === 'not_bound', 'Revocation prevents reading a historical blindbox result');
+$blindbox_rebound_uid = wp_insert_user(array('user_login' => 'fixture-blindbox-rebound', 'user_pass' => wp_generate_password()));
+verify(is_int($blindbox_rebound_uid)
+    && authorize_actor($blindbox_limit_actor, $blindbox_rebound_uid)->get_status() === 200,
+    'The same actor can bind a different independent fixture user');
+$blindbox_changed = call_api('blindbox/status', $blindbox_limit_actor, array(
+    'request_id' => $blindbox_text_event['request_id'],
+));
+verify($blindbox_changed->get_status() === 409
+    && $blindbox_changed->get_data()['code'] === 'binding_changed',
+    'A new binding cannot read the previous website user blindbox result');
+$blindbox_changed_replay = call_api('blindbox/open', $blindbox_limit_actor, $blindbox_text_event);
+verify($blindbox_changed_replay->get_status() === 409
+    && $blindbox_changed_replay->get_data()['code'] === 'binding_changed'
+    && zibpay_get_user_points($blindbox_rebound_uid) === 0,
+    'A replay cannot transfer the previous user reward to a replacement binding');
+
+$blindbox_config = $blindbox_saved_config;
+$blindbox_config['daily_free_limit'] = 1;
+$blindbox_config['daily_exchange_limit'] = 1;
+$blindbox_options['blindbox'] = $blindbox_config;
+update_option(AstrBotZibll\OPTION, $blindbox_options, false);
+$blindbox_parallel_uid = wp_insert_user(array('user_login' => 'fixture-blindbox-parallel', 'user_pass' => wp_generate_password()));
+verify(is_int($blindbox_parallel_uid), 'Concurrent blindbox tests use an independent fixture user');
+$blindbox_parallel_actor = array_merge($actor, array('sender_id' => 'blindbox-parallel'));
+$blindbox_parallel_other = array_merge($blindbox_parallel_actor, array('group_id' => 'other'));
+verify(authorize_actor($blindbox_parallel_actor, $blindbox_parallel_uid)->get_status() === 200
+    && authorize_actor($blindbox_parallel_other, $blindbox_parallel_uid)->get_status() === 200,
+    'Concurrent blindbox actors share one website user across groups');
+foreach (array('open' => 'blindbox_no_chances', 'exchange' => 'blindbox_exchange_limit') as $action => $rejection) {
+    clear_fixture_limits();
+    $start = microtime(true) + 3;
+    $workers = array(
+        spawn_blindbox_worker($table_prefix, $blindbox_parallel_actor, 'blindbox/' . $action, 'blindbox-parallel-' . $action . '-a', $start),
+        spawn_blindbox_worker($table_prefix, $blindbox_parallel_other, 'blindbox/' . $action, 'blindbox-parallel-' . $action . '-b', $start),
+    );
+    $worker_results = array();
+    foreach ($workers as [$process, $pipes]) {
+        $output = trim(stream_get_contents($pipes[1]));
+        $errors = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exit = proc_close($process);
+        $result = json_decode($output, true);
+        verify($exit === 0 && $errors === '' && is_array($result),
+            'Concurrent blindbox worker exits cleanly: ' . $action);
+        $worker_results[] = $result;
+    }
+    verify(count(array_filter($worker_results, static fn($result) => $result['status'] === 200
+        && ($result['data']['state'] ?? '') === 'completed')) === 1
+        && count(array_filter($worker_results, static fn($result) => $result['status'] === 200
+        && ($result['data']['state'] ?? '') === 'rejected'
+        && ($result['data']['error_code'] ?? '') === $rejection)) === 1,
+        'Concurrent groups settle the last available blindbox operation once: ' . $action . ' ' . wp_json_encode($worker_results));
+    AstrBotZibll\fresh_user_meta($blindbox_parallel_uid);
+    $daily = AstrBotZibll\blindbox_daily_row($blindbox_parallel_uid, current_datetime()->format('Y-m-d'));
+    verify((int) $daily['free_used'] === 1
+        && (int) $daily['exchange_bought'] === ($action === 'open' ? 0 : 1)
+        && (int) $daily['exchange_used'] === 0
+        && zibpay_get_user_points($blindbox_parallel_uid) === ($action === 'open' ? 50 : 25)
+        && count(zib_get_user_meta($blindbox_parallel_uid, 'points_record', true)) === ($action === 'open' ? 1 : 2),
+        'Concurrent blindbox counters, balance, and ledger agree: ' . $action);
+}
+
+$blindbox_fault_uid = wp_insert_user(array('user_login' => 'fixture-blindbox-fault', 'user_pass' => wp_generate_password()));
+$blindbox_fault_actor = array_merge($actor, array('sender_id' => 'blindbox-fault'));
+verify(is_int($blindbox_fault_uid)
+    && authorize_actor($blindbox_fault_actor, $blindbox_fault_uid)->get_status() === 200,
+    'Blindbox rollback uses an independent bound fixture user');
+$blindbox_fault_event = array(
+    'request_id' => hash('sha256', 'blindbox-write-failure'), 'event_time' => time(),
+);
+$blindbox_fault_key = AstrBotZibll\blindbox_request_key(
+    AstrBotZibll\actor_data_from_array($blindbox_fault_actor)['actor_hash'], $blindbox_fault_event['request_id']
+);
+$blindbox_fault_table = AstrBotZibll\blindbox_operation_table();
+$blindbox_fault_injected = false;
+$blindbox_fault_points_written = false;
+$blindbox_fault = static function ($query) use (
+    $blindbox_fault_table, $blindbox_fault_key, $blindbox_fault_uid, &$blindbox_fault_injected, &$blindbox_fault_points_written
+) {
+    if (!$blindbox_fault_injected && str_starts_with($query, "UPDATE `$blindbox_fault_table`")
+        && str_contains($query, "'completed'") && str_contains($query, $blindbox_fault_key)
+    ) {
+        $blindbox_fault_injected = true;
+        $blindbox_fault_points_written = zibpay_get_user_points($blindbox_fault_uid) === 50
+            && AstrBotZibll\points_record_matches(
+                $blindbox_fault_uid, 'astrbot:blindbox:' . substr($blindbox_fault_key, 0, 24), 50, 50
+            );
+        return 'AZ_INJECTED_DATABASE_FAILURE';
+    }
+    return $query;
+};
+clear_fixture_limits();
+$blindbox_error_display = $wpdb->suppress_errors(true);
+add_filter('query', $blindbox_fault);
+try {
+    $blindbox_fault_result = call_api('blindbox/open', $blindbox_fault_actor, $blindbox_fault_event);
+} finally {
+    remove_filter('query', $blindbox_fault);
+    $wpdb->suppress_errors($blindbox_error_display);
+}
+AstrBotZibll\fresh_user_meta($blindbox_fault_uid);
+verify($blindbox_fault_injected && $blindbox_fault_points_written
+    && $blindbox_fault_result->get_data()['data']['state'] === 'uncertain'
+    && zibpay_get_user_points($blindbox_fault_uid) === 0
+    && !zib_get_user_meta($blindbox_fault_uid, 'points_record', true)
+    && !AstrBotZibll\blindbox_daily_row($blindbox_fault_uid, current_datetime()->format('Y-m-d')),
+    'Failure after the real points write rolls back balance, ledger, and daily chances together');
+verify(call_api('blindbox/open', $blindbox_fault_actor, $blindbox_fault_event)->get_data()['data']['state'] === 'uncertain'
+    && zibpay_get_user_points($blindbox_fault_uid) === 0,
+    'A failed blindbox transaction is not automatically replayed');
+foreach (array(false, true) as $blindbox_rollback_failure) {
+    $fault_label = $blindbox_rollback_failure ? 'commit-and-rollback' : 'commit';
+    $commit_uid = wp_insert_user(array('user_login' => 'fixture-blindbox-' . $fault_label, 'user_pass' => wp_generate_password()));
+    $commit_actor = array_merge($actor, array('sender_id' => 'blindbox-' . $fault_label));
+    verify(is_int($commit_uid) && authorize_actor($commit_actor, $commit_uid)->get_status() === 200,
+        'Commit failure uses an independent bound user: ' . $fault_label);
+    $commit_event = array(
+        'request_id' => hash('sha256', 'blindbox-' . $fault_label . '-failure'), 'event_time' => time(),
+    );
+    $commit_key = AstrBotZibll\blindbox_request_key(
+        AstrBotZibll\actor_data_from_array($commit_actor)['actor_hash'], $commit_event['request_id']
+    );
+    $commit_injected = false;
+    $rollback_injected = false;
+    $commit_points_written = false;
+    $commit_fault = static function ($query) use (
+        $blindbox_rollback_failure, $commit_uid, $commit_key,
+        &$commit_injected, &$rollback_injected, &$commit_points_written
+    ) {
+        if (!$commit_injected && strtoupper(trim($query)) === 'COMMIT') {
+            $commit_injected = true;
+            $commit_points_written = zibpay_get_user_points($commit_uid) === 50
+                && AstrBotZibll\points_record_matches(
+                    $commit_uid, 'astrbot:blindbox:' . substr($commit_key, 0, 24), 50, 50
+                );
+            return 'AZ_INJECTED_COMMIT_FAILURE';
+        }
+        if ($blindbox_rollback_failure && $commit_injected && strtoupper(trim($query)) === 'ROLLBACK') {
+            $rollback_injected = true;
+            return 'AZ_INJECTED_ROLLBACK_FAILURE';
+        }
+        return $query;
+    };
+    clear_fixture_limits();
+    $commit_connection = $wpdb->get_var('SELECT CONNECTION_ID()');
+    $commit_error_display = $wpdb->suppress_errors(true);
+    add_filter('query', $commit_fault);
+    try {
+        $commit_response = call_api('blindbox/open', $commit_actor, $commit_event);
+    } finally {
+        remove_filter('query', $commit_fault);
+        $wpdb->suppress_errors($commit_error_display);
+    }
+    verify($commit_injected && $commit_points_written
+        && $commit_response->get_status() === 503
+        && $commit_response->get_data()['code'] === 'uncertain',
+        'A failed commit never reports an uncommitted award as completed: ' . $fault_label);
+    verify($blindbox_rollback_failure ? $wpdb->db_connect(false) : $wpdb->check_connection(false),
+        'The fixture database connection is available after commit failure');
+    if ($blindbox_rollback_failure) {
+        verify($rollback_injected && $wpdb->get_var('SELECT CONNECTION_ID()') !== $commit_connection,
+            'A failed rollback discards the connection holding the uncommitted award');
+    }
+    AstrBotZibll\fresh_user_meta($commit_uid);
+    $commit_row = AstrBotZibll\blindbox_operation_row($commit_key);
+    verify(in_array($commit_row['state'] ?? '', array('pending', 'uncertain'), true)
+        && zibpay_get_user_points($commit_uid) === 0
+        && !zib_get_user_meta($commit_uid, 'points_record', true)
+        && !AstrBotZibll\blindbox_daily_row($commit_uid, current_datetime()->format('Y-m-d')),
+        'Commit failure rolls back the real balance, ledger, and chance writes: ' . $fault_label);
+    $commit_status = call_api('blindbox/status', $commit_actor, array(
+        'request_id' => $commit_event['request_id'],
+    ))->get_data()['data'];
+    verify($commit_status['state'] === 'uncertain'
+        && $commit_status['request_id'] === $commit_event['request_id']
+        && call_api('blindbox/open', $commit_actor, $commit_event)->get_data()['data']['state'] === 'uncertain'
+        && zibpay_get_user_points($commit_uid) === 0,
+        'Status and replay preserve the unresolved commit without granting points: ' . $fault_label);
+}
+$reconnect_uid = wp_insert_user(array('user_login' => 'fixture-blindbox-reconnect', 'user_pass' => wp_generate_password()));
+$reconnect_actor = array_merge($actor, array('sender_id' => 'blindbox-reconnect'));
+verify(is_int($reconnect_uid) && authorize_actor($reconnect_actor, $reconnect_uid)->get_status() === 200,
+    'Connection replacement uses an independent bound user');
+$reconnect_event = array(
+    'request_id' => hash('sha256', 'blindbox-reconnect-failure'), 'event_time' => time(),
+);
+$reconnect_key = AstrBotZibll\blindbox_request_key(
+    AstrBotZibll\actor_data_from_array($reconnect_actor)['actor_hash'], $reconnect_event['request_id']
+);
+$reconnect_table = AstrBotZibll\blindbox_operation_table();
+$reconnect_injected = false;
+$reconnect_succeeded = false;
+$reconnect_points_written = false;
+$reconnect_fault = static function ($query) use (
+    $reconnect_table, $reconnect_key, $reconnect_uid,
+    &$reconnect_injected, &$reconnect_succeeded, &$reconnect_points_written
+) {
+    global $wpdb;
+    if (!$reconnect_injected && str_starts_with($query, "UPDATE `$reconnect_table`")
+        && str_contains($query, "'completed'") && str_contains($query, $reconnect_key)
+    ) {
+        $reconnect_injected = true;
+        $reconnect_points_written = zibpay_get_user_points($reconnect_uid) === 50
+            && AstrBotZibll\points_record_matches(
+                $reconnect_uid, 'astrbot:blindbox:' . substr($reconnect_key, 0, 24), 50, 50
+            );
+        mysqli_close($wpdb->dbh);
+        $reconnect_succeeded = $wpdb->db_connect(false);
+    }
+    return $query;
+};
+clear_fixture_limits();
+$reconnect_connection = $wpdb->get_var('SELECT CONNECTION_ID()');
+$reconnect_error_display = $wpdb->suppress_errors(true);
+add_filter('query', $reconnect_fault);
+try {
+    $reconnect_response = call_api('blindbox/open', $reconnect_actor, $reconnect_event);
+} finally {
+    remove_filter('query', $reconnect_fault);
+    $wpdb->suppress_errors($reconnect_error_display);
+}
+$reconnect_data = $reconnect_response->get_data();
+verify($reconnect_injected && $reconnect_succeeded && $reconnect_points_written
+    && $wpdb->get_var('SELECT CONNECTION_ID()') !== $reconnect_connection
+    && (($reconnect_response->get_status() === 503
+        && in_array($reconnect_data['code'] ?? '', array('uncertain', 'unavailable'), true))
+        || ($reconnect_data['data']['state'] ?? '') === 'uncertain'),
+    'A replacement connection cannot report the rolled-back award as completed');
+AstrBotZibll\fresh_user_meta($reconnect_uid);
+$reconnect_row = AstrBotZibll\blindbox_operation_row($reconnect_key);
+verify(in_array($reconnect_row['state'] ?? '', array('pending', 'uncertain'), true)
+    && zibpay_get_user_points($reconnect_uid) === 0
+    && !zib_get_user_meta($reconnect_uid, 'points_record', true)
+    && !AstrBotZibll\blindbox_daily_row($reconnect_uid, current_datetime()->format('Y-m-d')),
+    'Replacing the transaction connection rolls back balance, ledger, and chances without a false terminal result');
+$reconnect_status = call_api('blindbox/status', $reconnect_actor, array(
+    'request_id' => $reconnect_event['request_id'],
+))->get_data()['data'];
+$reconnect_replay = call_api('blindbox/open', $reconnect_actor, $reconnect_event)->get_data()['data'];
+verify($reconnect_status['state'] === 'uncertain' && $reconnect_replay['state'] === 'uncertain'
+    && $reconnect_status['request_id'] === $reconnect_event['request_id']
+    && $reconnect_replay['request_id'] === $reconnect_event['request_id']
+    && zibpay_get_user_points($reconnect_uid) === 0
+    && !zib_get_user_meta($reconnect_uid, 'points_record', true)
+    && !AstrBotZibll\blindbox_daily_row($reconnect_uid, current_datetime()->format('Y-m-d')),
+    'Status and replay never complete or settle a second time after transaction connection loss');
+$blindbox_config = $blindbox_saved_config;
+$blindbox_options['blindbox'] = $blindbox_config;
+update_option(AstrBotZibll\OPTION, $blindbox_options, false);
 
 remove_all_actions('save_post');
 remove_all_actions('wp_insert_post');
@@ -636,8 +1133,14 @@ verify(is_wp_error(AstrBotZibll\revoke_binding($hash, $uid2)), 'Website cannot r
 verify(!is_wp_error(AstrBotZibll\revoke_binding($hash, $uid)), 'Website owner can revoke own binding');
 clear_fixture_limits();
 verify(call_api('profile', array_merge($actor, array('group_id' => 'other')))->get_data()['code'] === 'not_bound', 'Website revocation invalidates next group request');
-for ($i = 0; $i < 10; ++$i) {
-    call_api('articles/latest', $actor);
+$rate_actor_hash = AstrBotZibll\actor_data_from_array($actor)['actor_hash'];
+$rate_bucket = (int) floor(time() / 30);
+foreach (array($rate_bucket, $rate_bucket + 1) as $bucket) {
+    verify($wpdb->insert(AstrBotZibll\state_table(), array(
+        'state_key' => hash('sha256', 'limit:actor:' . $rate_actor_hash . ':' . $bucket),
+        'expires_at' => ($bucket + 1) * 30,
+        'hits' => 10,
+    )) === 1, 'Seed an exhausted actor bucket in the isolated fixture');
 }
 verify(call_api('articles/latest', $actor)->get_status() === 429, 'Independent website actor rate limiting');
 

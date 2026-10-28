@@ -50,6 +50,11 @@ ERROR_MESSAGES = {
     "points_update_failed": "网站积分更新失败，未确认完成，请稍后查询。",
     "points_update_uncertain": "积分操作结果需要核实，已停止重复执行；请在网站查看积分记录。",
     "uncertain": "积分操作结果需要核实，已停止重复执行；请在网站查看积分记录。",
+    "blindbox_disabled": "盲盒功能当前未开放。",
+    "blindbox_config_invalid": "盲盒配置无效，请联系管理员检查网站设置。",
+    "blindbox_no_chances": "开盲盒次数不足，请稍后再试。",
+    "blindbox_exchange_limit": "今日兑换次数已达上限，本次未扣积分。",
+    "blindbox_unresolved": "盲盒操作结果未知，未自动重复执行；请稍后查询或联系管理员核对。",
 }
 
 
@@ -175,6 +180,159 @@ def points_text(
     )
 
 
+def _blindbox_count(data: dict, key: str) -> int:
+    value = data.get(key)
+    if type(value) is not int or value < 0:
+        raise BridgeError("invalid_response")
+    return value
+
+
+def _blindbox_snapshot(data: dict) -> tuple[int, int, int]:
+    free_remaining = _blindbox_count(data, "free_remaining")
+    exchange_remaining = _blindbox_count(data, "exchange_remaining")
+    available = _blindbox_count(data, "available")
+    if available != free_remaining + exchange_remaining:
+        raise BridgeError("invalid_response")
+    return free_remaining, exchange_remaining, available
+
+
+def blindbox_text(
+    data: dict,
+    action: str,
+    expected_request_id: str,
+    exchange_command: str,
+    open_command: str,
+) -> str:
+    if action not in {"blindbox_open", "blindbox_exchange"}:
+        raise BridgeError("invalid_response")
+    if data.get("request_id") != expected_request_id:
+        raise BridgeError("invalid_response")
+    state = data.get("state")
+    if (
+        state in {"completed", "rejected"}
+        and data.get("action") != ("open" if action == "blindbox_open" else "exchange")
+    ):
+        raise BridgeError("invalid_response")
+    if state in {"pending", "uncertain"}:
+        return "盲盒操作结果需要核实，已停止重复执行；请稍后查询或联系管理员核对。"
+    if state in {"not_started"}:
+        return "盲盒操作结果暂未确认，未自动重复执行；请稍后查询或联系管理员核对。"
+    if state == "rejected":
+        error_code = data.get("error_code")
+        if not isinstance(error_code, str):
+            raise BridgeError("invalid_response")
+        if error_code == "blindbox_disabled":
+            return "盲盒功能当前未开放。"
+        if error_code == "blindbox_config_invalid":
+            return "盲盒配置无效，请联系管理员检查网站设置。"
+        if error_code == "blindbox_no_chances":
+            exchange_limit = data.get("exchange_limit")
+            exchange_bought = data.get("exchange_bought")
+            cost = data.get("cost_points", data.get("exchange_cost_points"))
+            if (
+                type(exchange_limit) is int and exchange_limit >= 0
+                and type(exchange_bought) is int and 0 <= exchange_bought <= exchange_limit
+                and type(cost) is int and cost > 0
+            ):
+                remaining_exchange = exchange_limit - exchange_bought
+                if remaining_exchange:
+                    return (
+                        "开盲盒次数不足。\n"
+                        f"发送 {exchange_command} 可消耗 {cost} 积分兑换 1 次。\n"
+                        f"今日还可兑换 {remaining_exchange} 次，兑换次数仅今日有效。"
+                    )
+                return (
+                    "今日开盲盒次数已用完，"
+                    f"今日兑换也已达到 {exchange_limit} 次上限。"
+                )
+            return "开盲盒次数不足，请稍后再试。"
+        if error_code == "blindbox_exchange_limit":
+            exchange_limit = data.get("exchange_limit")
+            exchange_bought = data.get("exchange_bought")
+            if (
+                type(exchange_limit) is int and exchange_limit >= 0
+                and type(exchange_bought) is int and 0 <= exchange_bought <= exchange_limit
+            ):
+                return (
+                    f"今日兑换次数已达上限：{exchange_bought}/{exchange_limit} 次。\n"
+                    "本次未扣积分。"
+                )
+            return "今日兑换次数已达上限，本次未扣积分。"
+        if error_code == "insufficient_points":
+            cost = data.get("cost_points")
+            if type(cost) is int and cost > 0:
+                return (
+                    f"积分不足，兑换 1 次需要 {cost} 积分。\n"
+                    "本次未扣积分，未增加次数。"
+                )
+            return "积分不足，本次未扣积分，未增加次数。"
+        raise BridgeError(error_code)
+    if state != "completed":
+        raise BridgeError("invalid_response")
+    uid = data.get("uid")
+    if type(uid) is not int or uid <= 0:
+        raise BridgeError("invalid_response")
+    site_day = safe_text(data.get("site_day"), 32)
+    timezone = safe_text(data.get("timezone"), 64)
+    free_remaining, exchange_remaining, available = _blindbox_snapshot(data)
+    if action == "blindbox_open":
+        prize = data.get("prize")
+        if not isinstance(prize, dict):
+            raise BridgeError("invalid_response")
+        prize_name = safe_text(prize.get("name"), 80)
+        if not prize_name:
+            raise BridgeError("invalid_response")
+        prize_type = prize.get("type")
+        if prize_type == "points":
+            points = prize.get("points", data.get("points_delta"))
+            if type(points) is not int or points <= 0:
+                raise BridgeError("invalid_response")
+            points_before = data.get("points_before")
+            points_after = data.get("points_after")
+            if (
+                type(points_before) is not int or points_before < 0
+                or type(points_after) is not int or points_after < 0
+                or points_after != points_before + points
+            ):
+                raise BridgeError("invalid_response")
+            reward = f"获得：{points} 积分"
+        elif prize_type == "text":
+            text_prize = safe_text(prize.get("text"), 500)
+            if not text_prize:
+                raise BridgeError("invalid_response")
+            reward = f"获得：{text_prize}"
+        else:
+            raise BridgeError("invalid_response")
+        return (
+            "盲盒开启成功！\n"
+            f"{reward}\n"
+            f"今日剩余：{available} 次（免费 {free_remaining} 次，兑换 {exchange_remaining} 次）"
+        )
+    cost = data.get("cost_points", data.get("exchange_cost_points"))
+    before = data.get("points_before")
+    after = data.get("points_after")
+    bought = data.get("exchange_bought")
+    limit = data.get("exchange_limit")
+    if (
+        type(cost) is not int or cost <= 0
+        or type(before) is not int or before < 0
+        or type(after) is not int or after < 0
+        or after != before - cost
+        or type(bought) is not int or bought < 0
+        or type(limit) is not int or limit < 0 or bought > limit
+    ):
+        raise BridgeError("invalid_response")
+    return (
+        "兑换成功！\n"
+        f"消耗：{cost} 积分\n"
+        "增加：1 次开盲盒机会\n"
+        f"今日剩余：{available} 次（免费 {free_remaining} 次，兑换 {exchange_remaining} 次）\n"
+        f"今日已兑换：{bought}/{limit} 次\n"
+        f"有效期：{site_day}（{timezone}）\n"
+        f"发送 {open_command} 使用。"
+    )
+
+
 def event_identity(event, actor: Actor, action: str = "checkin") -> dict:
     message = getattr(event, "message_obj", None)
     message_id = getattr(message, "message_id", None)
@@ -189,6 +347,49 @@ def event_identity(event, actor: Actor, action: str = "checkin") -> dict:
         raise BridgeError("event_identity_required")
     key = json.dumps([asdict(actor), action, str(message_id)], sort_keys=True, ensure_ascii=False)
     return {"request_id": hashlib.sha256(key.encode()).hexdigest(), "event_time": int(timestamp)}
+
+
+async def execute_blindbox(
+    client: BridgeClient,
+    action: str,
+    actor: Actor,
+    event,
+) -> str:
+    if action not in {"blindbox_open", "blindbox_exchange"}:
+        raise BridgeError("invalid_parameters")
+    route_name = "blindbox/open" if action == "blindbox_open" else "blindbox/exchange"
+    identity = event_identity(event, actor, route_name)
+    body = {"actor": asdict(actor), **identity}
+    query_status = False
+    try:
+        data = await client.request("/" + route_name, body)
+        if data.get("request_id") != identity["request_id"]:
+            raise BridgeError("invalid_response")
+    except BridgeError as error:
+        if error.code not in {
+            "network_error", "http_error", "unavailable",
+            "invalid_response", "response_too_large", "uncertain",
+            "blindbox_unresolved",
+        }:
+            raise
+        query_status = True
+    if not query_status and data.get("state") in {"pending", "uncertain"}:
+        query_status = True
+    if query_status:
+        try:
+            data = await client.request("/blindbox/status", {
+                "actor": asdict(actor),
+                "request_id": identity["request_id"],
+            })
+        except BridgeError:
+            return "盲盒操作结果未知，未自动重复执行；请稍后查询或联系管理员核对。"
+    return blindbox_text(
+        data,
+        action,
+        identity["request_id"],
+        client.settings.router.commands["blindbox_exchange"],
+        client.settings.router.commands["blindbox_open"],
+    )
 
 
 async def execute(
@@ -263,6 +464,10 @@ async def execute(
             except BridgeError:
                 return "签到请求结果未知，未自动重试；请先在网站查看记录并核对奖励。", None
         return checkin_text(data), None
+    if action in {"blindbox_open", "blindbox_exchange"}:
+        if argument:
+            return f"用法：{commands[action]}（不带参数，每次操作 1 次）", None
+        return await execute_blindbox(client, action, actor, event), None
     if action in {"points_add", "points_subtract"}:
         target_id = match.target_id
         if not isinstance(target_id, str):

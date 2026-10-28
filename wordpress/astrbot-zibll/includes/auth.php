@@ -21,6 +21,7 @@ function settings()
         'allow_local_http' => false,
         'binding_background_color' => '#fff0f5',
         'binding_background_image' => '',
+        'blindbox' => blindbox_default_config(),
     ), is_array($saved) ? $saved : array());
 }
 
@@ -166,6 +167,9 @@ function authorize($request)
             'points/add' => array('target_actor', 'amount', 'request_id', 'event_time'),
             'points/subtract' => array('target_actor', 'amount', 'request_id', 'event_time'),
             'points/status' => array('request_id'),
+            'blindbox/open' => array('request_id', 'event_time'),
+            'blindbox/exchange' => array('request_id', 'event_time'),
+            'blindbox/status' => array('request_id'),
         );
         if (!is_array($input) || array_diff(array_keys($input), array_merge(array('actor'), $fields[$action]))) {
             return failure('invalid_parameters', 400);

@@ -13,13 +13,15 @@ DEFAULT_COMMANDS = {
     "search": "/网站搜索",
     "points_add": "/加积分",
     "points_subtract": "/减积分",
+    "blindbox_open": "/开盲盒",
+    "blindbox_exchange": "/兑换次数",
 }
 ARGUMENT_ACTIONS = frozenset({
     "confirm", "unbind", "search", "points_add", "points_subtract",
 })
 PRIMARY_ACTIONS = frozenset({
     "bind", "profile", "checkin", "latest", "search",
-    "points_add", "points_subtract",
+    "points_add", "points_subtract", "blindbox_open", "blindbox_exchange",
 })
 
 
@@ -85,7 +87,7 @@ class CommandRouter:
         if action is None:
             return None
         argument = parts[1].strip() if len(parts) == 2 else ""
-        if argument and action not in ARGUMENT_ACTIONS:
+        if argument and action not in ARGUMENT_ACTIONS | {"blindbox_open", "blindbox_exchange"}:
             return None
         return CommandMatch(action, argument)
 

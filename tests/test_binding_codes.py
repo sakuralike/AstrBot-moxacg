@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 from astrbot_plugin_zibll.client import BridgeError, PROTOCOL
 from astrbot_plugin_zibll.commands import Actor, CommandMatch, CommandRouter, DEFAULT_COMMANDS
-from astrbot_plugin_zibll.service import event_identity, execute
+from astrbot_plugin_zibll.service import blindbox_text, event_identity, execute
 from test_foundations import (
     At, Plain, Reply, StubEvent, config, load_main_with_framework_stubs,
 )
@@ -399,6 +399,286 @@ class PointsFilterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(results), 1)
         self.assertIn("积分管理功能当前不可用", results[0].text)
         self.plugin.client.request.assert_not_awaited()
+
+
+class BlindboxServiceTests(unittest.IsolatedAsyncioTestCase):
+    asyncTearDown = foundations.ClientTests.asyncTearDown
+
+    async def asyncSetUp(self):
+        await foundations.ClientTests.asyncSetUp(self)
+        self.actor = Actor("onebot-instance", "001", "group-1", "user-1")
+        self.event = StubEvent("/开盲盒")
+        self.event.message_obj = types.SimpleNamespace(
+            message_id="blindbox-1", timestamp=int(time.time()),
+        )
+
+    def completed(self, action="open"):
+        response = {
+            "state": "completed",
+            "request_id": event_identity(
+                self.event, self.actor, "blindbox/" + action,
+            )["request_id"],
+            "action": action,
+            "uid": 42,
+            "site_day": "2026-10-28",
+            "timezone": "Asia/Shanghai",
+            "free_remaining": 4,
+            "exchange_remaining": 0,
+            "available": 4,
+            "exchange_bought": 0,
+            "exchange_limit": 5,
+            "prize": {"name": "积分盲盒", "type": "points", "points": 186},
+            "points_before": 100,
+            "points_delta": 186,
+            "points_after": 286,
+        }
+        if action == "exchange":
+            response.update({
+                "free_remaining": 0, "exchange_remaining": 1, "available": 1,
+                "exchange_bought": 1, "cost_points": 25,
+                "points_delta": -25, "points_after": 75,
+            })
+        return response
+
+    async def test_open_posts_only_actor_and_stable_event_identity(self):
+        self.client.request = AsyncMock(return_value=self.completed())
+        first, _ = await execute(
+            self.client, CommandMatch("blindbox_open", ""), self.actor, self.event,
+        )
+        route, body = self.client.request.call_args.args
+        self.assertEqual(route, "/blindbox/open")
+        self.assertEqual(set(body), {"actor", "request_id", "event_time"})
+        self.assertEqual(body["actor"]["sender_id"], "user-1")
+        self.assertEqual(
+            body["request_id"],
+            event_identity(self.event, self.actor, "blindbox/open")["request_id"],
+        )
+        self.assertIn("获得：186 积分", first)
+        self.assertIn("今日剩余：4 次", first)
+
+    async def test_uncertain_write_queries_status_without_replaying(self):
+        for action in ("open", "exchange"):
+            with self.subTest(action=action):
+                self.client.request = AsyncMock(side_effect=[
+                    BridgeError("network_error"), self.completed(action),
+                ])
+                text, _ = await execute(
+                    self.client, CommandMatch("blindbox_" + action, ""),
+                    self.actor, self.event,
+                )
+                self.assertIn("成功", text)
+                self.assertEqual(
+                    [call.args[0] for call in self.client.request.await_args_list],
+                    ["/blindbox/" + action, "/blindbox/status"],
+                )
+                self.assertEqual(
+                    set(self.client.request.await_args_list[1].args[1]),
+                    {"actor", "request_id"},
+                )
+
+    async def test_exchange_validates_debit_and_uses_site_amount(self):
+        response = {
+            **self.completed("exchange"),
+            "free_remaining": 0,
+            "exchange_remaining": 1,
+            "available": 1,
+            "exchange_bought": 1,
+            "cost_points": 25,
+            "points_before": 40,
+            "points_delta": -25,
+            "points_after": 15,
+        }
+        self.client.request = AsyncMock(return_value=response)
+        text, _ = await execute(
+            self.client, CommandMatch("blindbox_exchange", ""), self.actor, self.event,
+        )
+        self.assertIn("消耗：25 积分", text)
+        self.assertIn("今日已兑换：1/5 次", text)
+        self.assertNotIn("quantity", self.client.request.call_args.args[1])
+
+        self.client.request = AsyncMock(return_value={
+            **response, "points_after": 16,
+        })
+        with self.assertRaises(BridgeError) as caught:
+            await execute(
+                self.client, CommandMatch("blindbox_exchange", ""), self.actor, self.event,
+            )
+        self.assertEqual(caught.exception.code, "invalid_response")
+
+    async def test_rejected_no_chances_uses_server_limits_and_price(self):
+        self.client.request = AsyncMock(return_value={
+            "state": "rejected",
+            "request_id": self.completed()["request_id"],
+            "action": "open",
+            "error_code": "blindbox_no_chances",
+            "exchange_limit": 5,
+            "exchange_bought": 2,
+            "exchange_cost_points": 25,
+        })
+        text, _ = await execute(
+            self.client, CommandMatch("blindbox_open", ""), self.actor, self.event,
+        )
+        self.assertIn("/兑换次数", text)
+        self.assertIn("25 积分", text)
+        self.assertIn("今日还可兑换 3 次", text)
+
+    async def test_arguments_return_usage_without_request(self):
+        self.client.request = AsyncMock()
+        for command in ("/开盲盒 100", "/兑换次数 3"):
+            with self.subTest(command=command):
+                match = self.settings.router.match(command)
+                self.assertIsNotNone(match)
+                text, _ = await execute(self.client, match, self.actor, self.event)
+                self.assertIn("用法：" + command.split()[0], text)
+        self.client.request.assert_not_awaited()
+
+    async def test_text_prize_is_plain_text_and_uses_remaining_purchased_chances(self):
+        self.client.request = AsyncMock(return_value={
+            **self.completed(),
+            "free_remaining": 0, "exchange_remaining": 2,
+            "exchange_available": 7, "available": 2,
+            "prize": {
+                "name": "今日好运", "type": "text",
+                "text": "<b>开心</b> [CQ:at,qq=all] @all",
+            },
+            "points_delta": 0, "points_after": 100,
+        })
+        text, _ = await execute(
+            self.client, CommandMatch("blindbox_open", ""), self.actor, self.event,
+        )
+        self.assertIn("获得：开心", text)
+        self.assertIn("兑换 2 次", text)
+        for unsafe in ("<b>", "[CQ:", "@all"):
+            self.assertNotIn(unsafe, text)
+
+        response = self.completed()
+        del response["exchange_remaining"]
+        response["exchange_available"] = 0
+        self.client.request = AsyncMock(return_value=response)
+        with self.assertRaises(BridgeError) as caught:
+            await execute(
+                self.client, CommandMatch("blindbox_open", ""), self.actor, self.event,
+            )
+        self.assertEqual(caught.exception.code, "invalid_response")
+
+    async def test_every_state_requires_request_identity_and_terminal_action(self):
+        expected = self.completed()["request_id"]
+        for state in ("pending", "uncertain", "not_started", "completed", "rejected"):
+            for request_id in (None, "f" * 64):
+                with self.subTest(state=state, request_id=request_id):
+                    response = {
+                        **self.completed(), "state": state, "request_id": request_id,
+                        "error_code": "blindbox_disabled",
+                    }
+                    with self.assertRaises(BridgeError) as caught:
+                        blindbox_text(
+                            response, "blindbox_open", expected, "/兑换次数", "/开盲盒",
+                        )
+                    self.assertEqual(caught.exception.code, "invalid_response")
+        for state in ("completed", "rejected"):
+            with self.subTest(state=state):
+                with self.assertRaises(BridgeError) as caught:
+                    blindbox_text(
+                        {**self.completed(), "state": state, "action": "exchange",
+                         "error_code": "blindbox_disabled"},
+                        "blindbox_open", expected, "/兑换次数", "/开盲盒",
+                    )
+                self.assertEqual(caught.exception.code, "invalid_response")
+
+    async def test_status_identity_mismatch_is_not_treated_as_original_result(self):
+        self.client.request = AsyncMock(side_effect=[
+            {"state": "pending", "request_id": "f" * 64},
+            {"state": "not_started", "request_id": "e" * 64},
+        ])
+        with self.assertRaises(BridgeError) as caught:
+            await execute(
+                self.client, CommandMatch("blindbox_open", ""), self.actor, self.event,
+            )
+        self.assertEqual(caught.exception.code, "invalid_response")
+        self.assertEqual(
+            [call.args[0] for call in self.client.request.await_args_list],
+            ["/blindbox/open", "/blindbox/status"],
+        )
+        self.assertEqual(
+            self.client.request.await_args_list[1].args[1]["request_id"],
+            self.completed()["request_id"],
+        )
+
+    async def test_capability_requires_flag_and_all_blindbox_routes(self):
+        base = {"protocol": PROTOCOL, "public_site_url": self.base}
+        routes = ["blindbox/open", "blindbox/exchange", "blindbox/status"]
+        for data, available in (
+            ({**base, "blindbox": True, "actions": routes}, True),
+            (base, False),
+            ({**base, "blindbox": True, "actions": routes[:-1]}, False),
+            ({**base, "blindbox": False, "actions": routes}, False),
+        ):
+            with self.subTest(data=data):
+                self.client.request = AsyncMock(return_value=data)
+                await self.client.capabilities()
+                self.assertIs(self.client.blindbox_available, available)
+
+
+class BlindboxFilterTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.module = load_main_with_framework_stubs()
+        self.plugin = self.module.ZibllPlugin(object(), config())
+        self.plugin.connected = True
+        self.plugin.client.blindbox_available = True
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+
+    async def test_arguments_stop_llm_and_return_usage_without_site_connection(self):
+        self.plugin.connected = False
+        self.plugin.client.blindbox_available = False
+        self.plugin.client.request = AsyncMock()
+        for command in ("/开盲盒 100", "/兑换次数 3"):
+            with self.subTest(command=command):
+                event = StubEvent(command)
+                replies = [reply async for reply in self.plugin.website_command(event)]
+                self.assertTrue(event.stopped)
+                self.assertIs(event.llm, False)
+                self.assertEqual(len(replies), 1)
+                self.assertIn("用法：" + command.split()[0], replies[0].text)
+        self.plugin.client.request.assert_not_awaited()
+
+    async def test_ordinary_member_can_open_without_points_operator_permission(self):
+        event = StubEvent("/开盲盒")
+        event.message_obj = types.SimpleNamespace(
+            message_id="blindbox-member", timestamp=int(time.time()),
+        )
+        actor = Actor(event.platform, event.bot, event.group, event.sender)
+        self.plugin.client.request = AsyncMock(return_value={
+            "state": "completed",
+            "request_id": event_identity(event, actor, "blindbox/open")["request_id"],
+            "action": "open", "uid": 42, "site_day": "2026-10-28",
+            "timezone": "Asia/Shanghai", "free_remaining": 4,
+            "exchange_remaining": 0, "available": 4,
+            "prize": {"name": "寄语", "type": "text", "text": "今天开心"},
+            "points_before": 100, "points_delta": 0, "points_after": 100,
+        })
+        replies = [reply async for reply in self.plugin.website_command(event)]
+        self.assertFalse(event.admin)
+        self.assertFalse(self.plugin.settings.points_operator_ids)
+        self.assertIs(event.llm, False)
+        self.assertTrue(event.stopped)
+        self.assertIn("盲盒开启成功", replies[0].text)
+        self.assertEqual(self.plugin.client.request.await_args.args[0], "/blindbox/open")
+
+    async def test_old_bridge_blocks_only_blindbox_without_write(self):
+        self.plugin.client.blindbox_available = False
+        self.plugin.client.request = AsyncMock(return_value={"items": []})
+        for command in ("/开盲盒", "/兑换次数"):
+            with self.subTest(command=command):
+                event = StubEvent(command)
+                replies = [reply async for reply in self.plugin.website_command(event)]
+                self.assertIs(event.llm, False)
+                self.assertIn("更新网站桥接插件", replies[0].text)
+        self.plugin.client.request.assert_not_awaited()
+        latest = [reply async for reply in self.plugin.website_command(StubEvent("/网站最新"))]
+        self.assertIn("未找到", latest[0].text)
+        self.plugin.client.request.assert_awaited_once()
 
 
 class CodeFilterTests(unittest.IsolatedAsyncioTestCase):

@@ -159,10 +159,11 @@ namespace {
     $wpdb->set_prefix($prefix);
     wp_cache_flush();
     $tables = array(
-        $wpdb->options, \AstrBotZibll\state_table(), \AstrBotZibll\binding_table(),
+        $wpdb->options, $wpdb->users, \AstrBotZibll\state_table(), \AstrBotZibll\binding_table(),
         \AstrBotZibll\daily_table(), \AstrBotZibll\operation_table(),
         \AstrBotZibll\binding_session_table(), \AstrBotZibll\binding_code_table(),
-        \AstrBotZibll\points_table(),
+        \AstrBotZibll\points_table(), \AstrBotZibll\blindbox_daily_table(),
+        \AstrBotZibll\blindbox_operation_table(),
     );
     $GLOBALS['az_test_admin'] = true;
     $GLOBALS['az_test_theme'] = 'zibll';
@@ -171,11 +172,31 @@ namespace {
         'checkin_s' => true, 'points_s' => true, 'user_level_s' => true,
     );
     try {
+        check($wpdb->users === $prefix . 'users', 'Users table is isolated');
         check($wpdb->query("CREATE TABLE {$wpdb->options} LIKE $original_options") !== false, 'Create isolated options');
+        check($wpdb->query("CREATE TABLE {$wpdb->users} (
+            ID bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            user_login varchar(60) NOT NULL DEFAULT '',
+            display_name varchar(250) NOT NULL DEFAULT '',
+            PRIMARY KEY (ID)
+        ) ENGINE=InnoDB") !== false, 'Create isolated users');
         \AstrBotZibll\install();
         check(\AstrBotZibll\settings()['enabled'] === false, 'Disabled by default');
         check(\AstrBotZibll\settings()['binding_background_color'] === '#fff0f5', 'Binding page defaults to pink');
         check(\AstrBotZibll\settings()['binding_background_image'] === '', 'Background image is optional');
+        $blindbox_defaults = \AstrBotZibll\settings()['blindbox'];
+        check($blindbox_defaults['enabled'] === false, 'Blindbox is disabled by default');
+        check($blindbox_defaults['daily_free_limit'] === 5, 'Blindbox defaults to five free opens');
+        check($blindbox_defaults['daily_exchange_limit'] === 5, 'Blindbox defaults to five daily exchanges');
+        check($blindbox_defaults['exchange_cost_points'] === 25, 'Blindbox defaults to 25 points per exchange');
+        check(count($blindbox_defaults['prizes']) === 1
+            && $blindbox_defaults['prizes'][0]['type'] === 'points'
+            && $blindbox_defaults['prizes'][0]['points_min'] === 50
+            && $blindbox_defaults['prizes'][0]['points_max'] === 300,
+            'Blindbox default prize awards 50 to 300 points');
+        check($blindbox_defaults['prizes'][0]['probability'] === '100.00'
+            && $blindbox_defaults['prizes'][0]['probability_bp'] === 10000,
+            'Blindbox default prize has full probability');
         $autoload = $wpdb->get_var($wpdb->prepare(
             "SELECT autoload FROM {$wpdb->options} WHERE option_name = %s",
             \AstrBotZibll\OPTION
@@ -247,6 +268,58 @@ namespace {
         check(\AstrBotZibll\save_settings(array_merge($appearance, array('binding_background_image' => ''))) === null, 'Background image can be cleared');
         check(\AstrBotZibll\settings()['binding_background_image'] === '', 'Clearing the image restores the color background');
         check(\AstrBotZibll\save_settings($appearance) === null, 'Restore custom appearance');
+        $blindbox_save = array_merge($save, array(
+            'blindbox_present' => '1',
+            'blindbox_enabled' => '1',
+            'blindbox_daily_free_limit' => '7',
+            'blindbox_daily_exchange_limit' => '3',
+            'blindbox_exchange_cost_points' => '30',
+            'blindbox_prizes' => array(
+                array(
+                    'id' => 'points_prize', 'name' => 'Points prize', 'type' => 'points',
+                    'probability' => '60.25', 'points_min' => '50', 'points_max' => '300',
+                ),
+                array(
+                    'id' => 'text_prize', 'name' => 'Text prize', 'type' => 'text',
+                    'probability' => '39.75', 'text' => 'Good luck & enjoy <today>',
+                ),
+            ),
+        ));
+        check(\AstrBotZibll\save_settings($blindbox_save) === null, 'Save mixed points and text prizes totaling 100 percent');
+        $before_blindbox = \AstrBotZibll\settings();
+        $blindbox = $before_blindbox['blindbox'];
+        check($blindbox['enabled'] === true && $blindbox['daily_free_limit'] === 7
+            && $blindbox['daily_exchange_limit'] === 3 && $blindbox['exchange_cost_points'] === 30,
+            'Save customized blindbox limits and price');
+        check($blindbox['prizes'][0] === array(
+            'id' => 'points_prize', 'name' => 'Points prize', 'type' => 'points',
+            'probability' => '60.25', 'probability_bp' => 6025,
+            'points_min' => 50, 'points_max' => 300,
+        ), 'Save normalized points prize and probability');
+        check($blindbox['prizes'][1] === array(
+            'id' => 'text_prize', 'name' => 'Text prize', 'type' => 'text',
+            'probability' => '39.75', 'probability_bp' => 3975,
+            'text' => 'Good luck & enjoy <today>',
+        ), 'Save text prize and probability');
+        $invalid_blindbox = array(
+            'Probability total below 100' => array('blindbox_prizes' => array(1 => array('probability' => '39.74'))),
+            'Probability total above 100' => array('blindbox_prizes' => array(1 => array('probability' => '39.76'))),
+            'Excess probability precision' => array('blindbox_prizes' => array(0 => array('probability' => '60.251'))),
+            'Negative probability' => array('blindbox_prizes' => array(0 => array('probability' => '-1'))),
+            'Negative free limit' => array('blindbox_daily_free_limit' => '-1'),
+            'Negative exchange limit' => array('blindbox_daily_exchange_limit' => '-1'),
+            'Negative exchange cost' => array('blindbox_exchange_cost_points' => '-1'),
+            'Negative points prize' => array('blindbox_prizes' => array(0 => array('points_min' => '-50'))),
+            'Duplicate prize ID' => array('blindbox_prizes' => array(1 => array('id' => 'points_prize'))),
+            'Reversed points range' => array('blindbox_prizes' => array(0 => array('points_min' => '301'))),
+        );
+        foreach ($invalid_blindbox as $label => $invalid) {
+            check(error_is(\AstrBotZibll\save_settings(array_replace_recursive($blindbox_save, $invalid)),
+                'blindbox_config_invalid', 400), $label . ' rejected');
+            check(\AstrBotZibll\settings() === $before_blindbox, $label . ' preserves saved settings');
+        }
+        check(\AstrBotZibll\save_settings($save) === null, 'Older settings forms preserve blindbox configuration');
+        check(\AstrBotZibll\settings() === $before_blindbox, 'Missing blindbox fields do not overwrite prizes');
         $save['az_action'] = 'revoke';
         check(\AstrBotZibll\save_settings($save) === null, 'Revoke credentials');
         $revoked = \AstrBotZibll\settings();
@@ -393,10 +466,23 @@ namespace {
         check(str_contains($html, 'name="binding_background_color" value="#aaccee"'), 'Admin exposes the saved color picker');
         check(str_contains($html, 'name="binding_background_image"'), 'Admin exposes the background URL field');
         check(str_contains($html, esc_attr($appearance['binding_background_image'])), 'Admin escapes the saved background URL');
+        foreach (array(
+            'blindbox_present', 'blindbox_enabled', 'blindbox_daily_free_limit',
+            'blindbox_daily_exchange_limit', 'blindbox_exchange_cost_points',
+            'blindbox_prizes[0][probability]', 'blindbox_prizes[0][points_min]',
+            'blindbox_prizes[0][points_max]', 'blindbox_prizes[1][text]',
+        ) as $field) {
+            check(str_contains($html, 'name="' . $field . '"'), 'Admin exposes ' . $field);
+        }
+        check(str_contains($html, 'value="points_prize"') && str_contains($html, 'value="text_prize"'),
+            'Admin displays saved points and text prizes');
+        check(str_contains($html, esc_textarea($blindbox['prizes'][1]['text']))
+            && !str_contains($html, $blindbox['prizes'][1]['text']),
+            'Admin escapes saved blindbox text');
         echo "PASS $checks checks (isolated WordPress REST/wpdb; theme and admin identity doubles)\n";
     } finally {
         foreach ($tables as $table) {
-            if (!preg_match('/\Aazt_[0-9a-f]{12}_(options|astrbot_zibll_(state|bindings|daily|operations|binding_sessions|binding_codes|points_operations))\z/', $table)) {
+            if (!preg_match('/\Aazt_[0-9a-f]{12}_(options|users|astrbot_zibll_(state|bindings|daily|operations|binding_sessions|binding_codes|points_operations|blindbox_daily|blindbox_operations))\z/', $table)) {
                 throw new \RuntimeException('Refusing unsafe test table cleanup.');
             }
             $wpdb->query("DROP TABLE IF EXISTS $table");
