@@ -89,7 +89,7 @@
         "type": "string",
         "description": "服务商模型 Base URL",
         "default": "",
-        "hint": "与 API Key 一起用于自动推导已确认的余额接口；必须是固定 HTTPS 地址，不填模型推理地址以外的账户接口。"
+        "hint": "填写模型推理 Base URL，与 API Key 一起用于自动推导已确认的余额接口；必须是固定 HTTPS 地址，不要填写账户余额接口。"
       },
       "api_key": {
         "type": "string",
