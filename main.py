@@ -2,6 +2,7 @@ import hashlib
 import json
 import re
 import time
+import unicodedata
 from collections.abc import Mapping
 
 from astrbot.api import AstrBotConfig, logger
@@ -9,6 +10,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.star import Context, Star
 
+from .balance import BalanceClient, BalanceSettings
 from .client import BridgeClient, BridgeError, Settings
 from .commands import Actor, CommandMatch, valid_identity
 from .service import ERROR_MESSAGES, binding_event_identity, execute
@@ -239,7 +241,7 @@ def _adapter_probe_report(event: AstrMessageEvent) -> dict:
     }
 
 
-def event_actor(event: AstrMessageEvent, settings: Settings) -> Actor:
+def event_actor(event: AstrMessageEvent, settings: Settings | BalanceSettings) -> Actor:
     actor = Actor(
         event.get_platform_id(), event.get_self_id(),
         event.get_group_id(), event.get_sender_id(),
@@ -248,6 +250,57 @@ def event_actor(event: AstrMessageEvent, settings: Settings) -> Actor:
     if event.get_platform_name() == "qq_official" and scope in settings.scopes:
         return Actor(*scope, actor.sender_id)
     return actor
+
+
+class ScopedBalanceFilter(filter.CustomFilter):
+    settings: BalanceSettings | None = None
+
+    @classmethod
+    def match(cls, event: AstrMessageEvent) -> CommandMatch | None:
+        settings = cls.settings
+        if settings is None or not event.is_at_or_wake_command:
+            return None
+        if not filter.EventMessageTypeFilter(
+            filter.EventMessageType.GROUP_MESSAGE
+        ).filter(event, {}):
+            return None
+        try:
+            actor = event_actor(event, settings)
+        except (ValueError, TypeError, AttributeError):
+            return None
+        if actor.scope not in settings.scopes or actor.sender_id in {
+            actor.bot_self_id, event.get_self_id(),
+        }:
+            return None
+        messages = event.get_messages()
+        if not isinstance(messages, (list, tuple)):
+            return None
+        text = []
+        self_id = str(event.get_self_id())
+        for component in messages:
+            if isinstance(component, Plain) and isinstance(component.text, str):
+                cleaned, mention_ids = _clean_plain_mentions(component.text)
+                if any(value != self_id for value in mention_ids):
+                    return None
+                text.append(cleaned)
+            elif isinstance(component, At) and str(component.qq) == self_id:
+                text.append(" ")
+            else:
+                return None
+        if any(value != self_id for value in _raw_mention_ids(event)):
+            return None
+        value = "".join(text)
+        if len(value) > 512 or any(
+            unicodedata.category(c).startswith("C") and c != "\t" for c in value
+        ):
+            return None
+        parts = value.strip().split(maxsplit=1)
+        if not parts or parts[0] != settings.command:
+            return None
+        return CommandMatch("balance", parts[1].strip() if len(parts) == 2 else "")
+
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        return self.match(event) is not None
 
 
 class ScopedCommandFilter(filter.CustomFilter):
@@ -344,8 +397,12 @@ class ZibllPlugin(Star):
         super().__init__(context)
         self.settings = None
         self.client = None
+        self.balance_settings = None
+        self.balance_client = None
         self.connected = False
         self._terminated = False
+        self._balance_inflight = False
+        self._balance_cooldown_until = 0.0
         self._cooldowns = {}
         self._processed = {}
         self._inflight = set()
@@ -354,6 +411,19 @@ class ZibllPlugin(Star):
         ScopedCommandFilter.processed = {}
         ScopedCommandFilter.code_ready = False
         ScopedCommandFilter.points_ready = False
+        ScopedBalanceFilter.settings = None
+        if config.get("balance_enabled", False) is True:
+            try:
+                balance_settings = BalanceSettings.from_config(config)
+            except ValueError:
+                logger.error("模型余额配置无效，请检查余额指令、允许群及超时配置。")
+            else:
+                if balance_settings.scopes:
+                    self.balance_settings = balance_settings
+                    self.balance_client = BalanceClient(balance_settings)
+                    ScopedBalanceFilter.settings = balance_settings
+                else:
+                    logger.warning("模型余额未配置允许群，查询保持关闭。")
         if config.get("enabled", False) is not True:
             return
         try:
@@ -386,6 +456,46 @@ class ZibllPlugin(Star):
             ScopedCommandFilter.code_ready = self.client.binding_code_available
             ScopedCommandFilter.points_ready = self.client.points_management_available
             logger.info("AstrBot-Zibll 认证连通验证通过。")
+
+    @filter.custom_filter(ScopedBalanceFilter, priority=100)
+    async def balance_command(self, event: AstrMessageEvent):
+        if (
+            self._terminated or self.balance_client is None
+            or ScopedBalanceFilter.settings is not self.balance_settings
+        ):
+            return
+        match = ScopedBalanceFilter.match(event)
+        if match is None:
+            return
+        event.should_call_llm(False)
+        event.stop_event()
+        try:
+            is_admin = event.is_admin() is True
+        except Exception:
+            is_admin = False
+        if not is_admin:
+            yield event.plain_result(
+                "模型余额仅允许 AstrBot 管理员查询。"
+            ).use_markdown(False).stop_event()
+            return
+        now = time.monotonic()
+        if self._balance_inflight or now < self._balance_cooldown_until:
+            yield event.plain_result(
+                "操作过于频繁，请稍后再试。"
+            ).use_markdown(False).stop_event()
+            return
+        self._balance_cooldown_until = now + 3
+        self._balance_inflight = True
+        try:
+            text = await self.balance_client.query(match.argument)
+        except Exception:
+            text = "余额查询失败，请检查余额配置或稍后重试。"
+            logger.warning("模型余额查询失败。")
+        finally:
+            self._balance_inflight = False
+        if self._terminated or ScopedBalanceFilter.settings is not self.balance_settings:
+            return
+        yield event.plain_result(text).use_markdown(False).stop_event()
 
     @filter.custom_filter(ScopedCommandFilter, priority=100)
     async def website_command(self, event: AstrMessageEvent):
@@ -509,6 +619,8 @@ class ZibllPlugin(Star):
 
     async def terminate(self):
         self._terminated = True
+        if ScopedBalanceFilter.settings is self.balance_settings:
+            ScopedBalanceFilter.settings = None
         if ScopedCommandFilter.settings is self.settings:
             ScopedCommandFilter.settings = None
             ScopedCommandFilter.pending = {}
@@ -519,3 +631,5 @@ class ZibllPlugin(Star):
         self.connected = False
         if self.client is not None:
             await self.client.close()
+        if self.balance_client is not None:
+            await self.balance_client.close()

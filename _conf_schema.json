@@ -37,7 +37,87 @@
     "type": "list",
     "description": "允许的群范围",
     "default": [],
-    "hint": "每项为 平台实例ID|机器人自身ID|群ID。空列表关闭全部群，不支持通配符。"
+    "hint": "网站联动和余额查询共用。每项为 平台实例ID|机器人自身ID|群ID。空列表关闭全部群，不支持通配符。"
+  },
+  "balance_enabled": {
+    "type": "bool",
+    "description": "启用模型余额查询",
+    "default": false,
+    "hint": "仅允许群内的 AstrBot 管理员查询，独立于网站联动开关。保存后重载插件。"
+  },
+  "balance_command": {
+    "type": "string",
+    "description": "模型余额指令",
+    "default": "/模型余额",
+    "hint": "仍需满足核心唤醒前缀或 @机器人。可追加 DeepSeek 或兼容服务商名称；不能与网站指令重名。"
+  },
+  "deepseek_api_key": {
+    "type": "string",
+    "description": "DeepSeek 官方余额 API Key",
+    "secret": true,
+    "default": "",
+    "hint": "仅用于 DeepSeek 官方 /user/balance。第三方平台的模型密钥不能填在这里；留空显示未配置。"
+  },
+  "compatible_balance": {
+    "type": "object",
+    "description": "兼容服务商账户余额",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用兼容服务商余额",
+        "default": false,
+        "hint": "先向服务商确认账户余额接口。Responses 兼容性不代表支持通用余额接口。"
+      },
+      "name": {
+        "type": "string",
+        "description": "服务商显示名称",
+        "default": "兼容服务商"
+      },
+      "url": {
+        "type": "string",
+        "description": "完整余额接口 HTTPS 地址",
+        "default": "",
+        "hint": "填写账户余额接口，不填模型推理地址或密钥额度接口；不支持 URL 中携带凭据或自动重定向。"
+      },
+      "credential": {
+        "type": "string",
+        "description": "余额接口 Bearer 凭据",
+        "secret": true,
+        "default": "",
+        "hint": "仅发送至上方地址。New API 的账户接口需要账户 access token，不能用模型 API Key 代替。"
+      },
+      "method": {
+        "type": "string",
+        "description": "查询方法",
+        "default": "GET",
+        "options": ["GET", "POST"],
+        "hint": "按服务商接口填写；POST 不发送请求体。"
+      },
+      "balance_path": {
+        "type": "string",
+        "description": "账户余额 JSON 字段",
+        "default": "",
+        "hint": "仅支持点分对象字段，例如 data.balance 或 data.quota；不支持数组或计算表达式。"
+      },
+      "unit": {
+        "type": "string",
+        "description": "余额币种或单位",
+        "default": "",
+        "hint": "按接口确认的单位填写，例如 CNY、USD 或额度；不要将未知额度标成货币。"
+      },
+      "divisor": {
+        "type": "string",
+        "description": "余额换算除数",
+        "default": "1",
+        "hint": "展示值 = 原始余额 / 除数。默认保留原值；仅在服务商明确换算规则后调整。"
+      },
+      "user_id": {
+        "type": "string",
+        "description": "New-Api-User",
+        "default": "",
+        "hint": "仅在服务商的账户余额接口要求该请求头时填写账户数字 ID，其他接口留空。"
+      }
+    }
   },
   "allow_local_http": {
     "type": "bool",
