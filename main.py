@@ -14,6 +14,11 @@ from .balance import BalanceClient, BalanceSettings
 from .client import BridgeClient, BridgeError, Settings
 from .commands import Actor, CommandMatch, valid_identity
 from .service import ERROR_MESSAGES, binding_event_identity, execute
+from .usage import (
+    ERROR_MESSAGES as USAGE_ERROR_MESSAGES,
+    TokenUsageClient,
+    TokenUsageSettings,
+)
 
 ADAPTER_PROBE_COMMAND = "/适配器核查"
 PROBE_ID_FIELDS = {
@@ -303,6 +308,59 @@ class ScopedBalanceFilter(filter.CustomFilter):
         return self.match(event) is not None
 
 
+class ScopedUsageFilter(filter.CustomFilter):
+    settings: TokenUsageSettings | None = None
+
+    @classmethod
+    def match(cls, event: AstrMessageEvent) -> CommandMatch | None:
+        settings = cls.settings
+        if settings is None or not event.is_at_or_wake_command:
+            return None
+        if not filter.EventMessageTypeFilter(
+            filter.EventMessageType.GROUP_MESSAGE
+        ).filter(event, {}):
+            return None
+        try:
+            actor = event_actor(event, settings)
+        except (ValueError, TypeError, AttributeError):
+            return None
+        if actor.scope not in settings.scopes or actor.sender_id in {
+            actor.bot_self_id, event.get_self_id(),
+        }:
+            return None
+        messages = event.get_messages()
+        if not isinstance(messages, (list, tuple)):
+            return None
+        text = []
+        self_id = str(event.get_self_id())
+        for component in messages:
+            if isinstance(component, Plain) and isinstance(component.text, str):
+                cleaned, mention_ids = _clean_plain_mentions(component.text)
+                if any(value != self_id for value in mention_ids):
+                    return None
+                text.append(cleaned)
+            elif isinstance(component, At) and str(component.qq) == self_id:
+                text.append(" ")
+            else:
+                return None
+        if any(value != self_id for value in _raw_mention_ids(event)):
+            return None
+        value = "".join(text)
+        if len(value) > 512 or any(
+            unicodedata.category(c).startswith("C") and c != "\t" for c in value
+        ):
+            return None
+        parts = value.strip().split(maxsplit=1)
+        if not parts or parts[0] != settings.command:
+            return None
+        return CommandMatch(
+            "token_usage", parts[1].strip() if len(parts) == 2 else "",
+        )
+
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        return self.match(event) is not None
+
+
 class ScopedCommandFilter(filter.CustomFilter):
     settings: Settings | None = None
     pending = {}
@@ -399,10 +457,14 @@ class ZibllPlugin(Star):
         self.client = None
         self.balance_settings = None
         self.balance_client = None
+        self.usage_settings = None
+        self.usage_client = None
         self.connected = False
         self._terminated = False
         self._balance_inflight = False
         self._balance_cooldown_until = 0.0
+        self._usage_inflight = False
+        self._usage_cooldown_until = 0.0
         self._cooldowns = {}
         self._processed = {}
         self._inflight = set()
@@ -412,6 +474,7 @@ class ZibllPlugin(Star):
         ScopedCommandFilter.code_ready = False
         ScopedCommandFilter.points_ready = False
         ScopedBalanceFilter.settings = None
+        ScopedUsageFilter.settings = None
         if config.get("balance_enabled", False) is True:
             try:
                 balance_settings = BalanceSettings.from_config(config)
@@ -424,6 +487,18 @@ class ZibllPlugin(Star):
                     ScopedBalanceFilter.settings = balance_settings
                 else:
                     logger.warning("模型余额未配置允许群，查询保持关闭。")
+        if config.get("token_usage_enabled", False) is True:
+            try:
+                usage_settings = TokenUsageSettings.from_config(config)
+            except ValueError:
+                logger.error("模型用量配置无效，请检查模型用量指令及允许群配置。")
+            else:
+                if usage_settings.scopes:
+                    self.usage_settings = usage_settings
+                    self.usage_client = TokenUsageClient(context)
+                    ScopedUsageFilter.settings = usage_settings
+                else:
+                    logger.warning("模型用量未配置允许群，查询保持关闭。")
         if config.get("enabled", False) is not True:
             return
         try:
@@ -494,6 +569,48 @@ class ZibllPlugin(Star):
         finally:
             self._balance_inflight = False
         if self._terminated or ScopedBalanceFilter.settings is not self.balance_settings:
+            return
+        yield event.plain_result(text).use_markdown(False).stop_event()
+
+    @filter.custom_filter(ScopedUsageFilter, priority=100)
+    async def usage_command(self, event: AstrMessageEvent):
+        if (
+            self._terminated or self.usage_client is None
+            or ScopedUsageFilter.settings is not self.usage_settings
+        ):
+            return
+        match = ScopedUsageFilter.match(event)
+        if match is None:
+            return
+        event.should_call_llm(False)
+        event.stop_event()
+        try:
+            is_admin = event.is_admin() is True
+        except Exception:
+            is_admin = False
+        if not is_admin:
+            yield event.plain_result(
+                "模型用量仅允许 AstrBot 管理员查询。"
+            ).use_markdown(False).stop_event()
+            return
+        now = time.monotonic()
+        if self._usage_inflight or now < self._usage_cooldown_until:
+            yield event.plain_result(
+                "操作过于频繁，请稍后再试。"
+            ).use_markdown(False).stop_event()
+            return
+        self._usage_cooldown_until = now + 3
+        self._usage_inflight = True
+        try:
+            text = await self.usage_client.query(match.argument)
+        except Exception as error:
+            text = USAGE_ERROR_MESSAGES.get(
+                getattr(error, "code", ""), USAGE_ERROR_MESSAGES["query_failed"],
+            )
+            logger.warning("模型用量查询失败。")
+        finally:
+            self._usage_inflight = False
+        if self._terminated or ScopedUsageFilter.settings is not self.usage_settings:
             return
         yield event.plain_result(text).use_markdown(False).stop_event()
 
@@ -621,6 +738,8 @@ class ZibllPlugin(Star):
         self._terminated = True
         if ScopedBalanceFilter.settings is self.balance_settings:
             ScopedBalanceFilter.settings = None
+        if ScopedUsageFilter.settings is self.usage_settings:
+            ScopedUsageFilter.settings = None
         if ScopedCommandFilter.settings is self.settings:
             ScopedCommandFilter.settings = None
             ScopedCommandFilter.pending = {}
@@ -633,3 +752,5 @@ class ZibllPlugin(Star):
             await self.client.close()
         if self.balance_client is not None:
             await self.balance_client.close()
+        if self.usage_client is not None:
+            await self.usage_client.close()

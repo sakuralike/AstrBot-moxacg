@@ -51,6 +51,18 @@
     "default": "/模型余额",
     "hint": "仍需满足核心唤醒前缀或 @机器人。可追加 DeepSeek 或兼容服务商名称；不能与网站指令重名。"
   },
+  "token_usage_enabled": {
+    "type": "bool",
+    "description": "启用模型 Tokens 用量查询",
+    "default": false,
+    "hint": "仅允许配置群内的 AstrBot 管理员查询，数据来自 AstrBot provider_stats 内部 Agent 记录。保存后重载插件。"
+  },
+  "token_usage_command": {
+    "type": "string",
+    "description": "模型用量指令",
+    "default": "/模型用量",
+    "hint": "可追加 今天 或 本月；仍需满足核心唤醒前缀或 @机器人，不能与网站及余额指令重名。"
+  },
   "deepseek_api_key": {
     "type": "string",
     "description": "DeepSeek 官方余额 API Key",
@@ -72,6 +84,19 @@
         "type": "string",
         "description": "服务商显示名称",
         "default": "兼容服务商"
+      },
+      "base_url": {
+        "type": "string",
+        "description": "服务商模型 Base URL",
+        "default": "",
+        "hint": "与 API Key 一起用于自动推导已确认的余额接口；必须是固定 HTTPS 地址，不填模型推理地址以外的账户接口。"
+      },
+      "api_key": {
+        "type": "string",
+        "description": "服务商 API Key",
+        "secret": true,
+        "default": "",
+        "hint": "仅发送到自动推导的服务商余额接口；未知服务商不会凭模型 URL 猜测余额接口。"
       },
       "url": {
         "type": "string",

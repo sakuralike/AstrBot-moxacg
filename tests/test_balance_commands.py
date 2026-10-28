@@ -267,6 +267,9 @@ class BalanceCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(schema["deepseek_api_key"]["secret"], True)
         compatible = schema["compatible_balance"]["items"]
         self.assertIs(compatible["enabled"]["default"], False)
+        self.assertIs(compatible["api_key"]["secret"], True)
+        self.assertEqual(compatible["base_url"]["default"], "")
+        self.assertEqual(compatible["api_key"]["default"], "")
         self.assertIs(compatible["credential"]["secret"], True)
         self.assertEqual(compatible["url"]["default"], "")
         self.assertEqual(compatible["unit"]["default"], "")

@@ -135,6 +135,106 @@ class BalanceSettingsTests(unittest.TestCase):
                 self.assertNotIn(ACCOUNT_TOKEN, settings.compatible_name)
                 self.assertNotIn(DEEPSEEK_KEY, settings.compatible_name)
 
+    def test_base_url_and_api_key_derive_only_confirmed_balance_contracts(self):
+        config = balance_config()
+        config["compatible_balance"] = {
+            "enabled": True,
+            "name": "DeepSeek 自动",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "auto-deepseek-key",
+        }
+        settings = BalanceSettings.from_config(config)
+        self.assertIsNone(settings.compatible_error)
+        self.assertEqual(settings.compatible.url, "https://api.deepseek.com/user/balance")
+        self.assertEqual(settings.compatible.credential, "auto-deepseek-key")
+        self.assertEqual(settings.compatible.result_kind, "deepseek")
+        self.assertNotIn("auto-deepseek-key", repr(settings))
+
+        for base_url in (
+            "https://new-api.example/v1/responses",
+            "https://relay.example/one-api/v1",
+        ):
+            with self.subTest(base_url=base_url):
+                config = balance_config()
+                config["compatible_balance"] = {
+                    "enabled": True,
+                    "name": "中转 API",
+                    "base_url": base_url,
+                    "api_key": "auto-api-key",
+                }
+                settings = BalanceSettings.from_config(config)
+                self.assertIsNone(settings.compatible_error)
+                self.assertTrue(settings.compatible.url.endswith("/api/usage/token"))
+                self.assertEqual(settings.compatible.balance_path, ("data", "total_available"))
+                self.assertEqual(settings.compatible.divisor, Decimal("500000"))
+                self.assertEqual(settings.compatible.result_kind, "api_key_quota")
+                self.assertNotIn("auto-api-key", repr(settings))
+
+    def test_base_url_derivation_fails_closed_for_unknown_or_account_only_endpoint(self):
+        config = balance_config()
+        config["compatible_balance"] = {
+            "enabled": True,
+            "name": "未知服务",
+            "base_url": "https://unknown.example/v1",
+            "api_key": "unknown-key",
+        }
+        settings = BalanceSettings.from_config(config)
+        self.assertIsNone(settings.compatible)
+        self.assertEqual(settings.compatible_error, "not_configured")
+
+        config = balance_config()
+        config["compatible_balance"] = {
+            "enabled": True,
+            "name": "New API",
+            "base_url": "https://new-api.example/api/user/self",
+            "api_key": "model-key",
+        }
+        settings = BalanceSettings.from_config(config)
+        self.assertIsNone(settings.compatible)
+        self.assertEqual(settings.compatible_error, "invalid_config")
+
+    def test_magpie_known_hosts_derive_fixed_balance_contracts(self):
+        cases = {
+            "https://api.moonshot.cn/v1": (
+                "https://api.moonshot.cn/v1/users/me/balance", "CNY", "known",
+            ),
+            "https://api.moonshot.ai/v1": (
+                "https://api.moonshot.ai/v1/users/me/balance", "USD", "known",
+            ),
+            "https://openrouter.ai/api/v1": (
+                "https://openrouter.ai/api/v1/credits", "USD", "openrouter",
+            ),
+            "https://api.stepfun.com/v1": (
+                "https://api.stepfun.com/v1/accounts", "CNY", "known",
+            ),
+            "https://api.stepfun.ai/v1": (
+                "https://api.stepfun.ai/v1/accounts", "USD", "known",
+            ),
+            "https://api.commandcode.ai/v1": (
+                "https://api.commandcode.ai/alpha/billing/credits", "USD", "commandcode",
+            ),
+            "https://ollama.com/v1": (
+                "https://ollama.com/api/balance", "USD", "ollama",
+            ),
+            "https://aihubmix.com/v1": (
+                "https://aihubmix.com/dashboard/billing/remain", "USD", "aihubmix_key",
+            ),
+        }
+        for base_url, (endpoint, unit, result_kind) in cases.items():
+            with self.subTest(base_url=base_url):
+                config = balance_config()
+                config["compatible_balance"] = {
+                    "enabled": True,
+                    "name": "自动服务商",
+                    "base_url": base_url,
+                    "api_key": "auto-api-key",
+                }
+                settings = BalanceSettings.from_config(config)
+                self.assertIsNone(settings.compatible_error)
+                self.assertEqual(settings.compatible.url, endpoint)
+                self.assertEqual(settings.compatible.unit, unit)
+                self.assertEqual(settings.compatible.result_kind, result_kind)
+
 
 class BalanceHttpTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -255,6 +355,141 @@ class BalanceHttpTests(unittest.IsolatedAsyncioTestCase):
         await self.client.query("兼容")
         self.assertEqual(self.requests[-1]["method"], "POST")
         self.assertEqual(self.requests[-1]["body"], b"")
+
+    async def test_derived_new_api_key_quota_is_not_reported_as_account_balance(self):
+        config = balance_config()
+        config["compatible_balance"] = {
+            "enabled": True,
+            "name": "中转 API",
+            "base_url": "https://new-api.example/v1/responses",
+            "api_key": "derived-api-key",
+        }
+        settings = BalanceSettings.from_config(config)
+        settings = dataclasses.replace(
+            settings,
+            compatible=dataclasses.replace(
+                settings.compatible,
+                url=self.base + "/api/usage/token",
+            ),
+        )
+        self.client.settings = settings
+        self.body = b'{"success":true,"data":{"total_available":1000000}}'
+        text = await self.client.query("兼容")
+        self.assertIn("API Key 剩余额度", text)
+        self.assertIn("额度：USD 2.00", text)
+        self.assertNotIn("当前账户余额", text)
+        self.assertEqual(self.requests[-1]["path"], "/api/usage/token")
+        self.assertEqual(
+            self.requests[-1]["headers"]["Authorization"], "Bearer derived-api-key",
+        )
+
+    async def test_derived_deepseek_endpoint_uses_official_balance_parser(self):
+        config = balance_config()
+        config["compatible_balance"] = {
+            "enabled": True,
+            "name": "DeepSeek 自动",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "derived-deepseek-key",
+        }
+        settings = BalanceSettings.from_config(config)
+        settings = dataclasses.replace(
+            settings,
+            compatible=dataclasses.replace(
+                settings.compatible,
+                url=self.base + "/user/balance",
+            ),
+        )
+        self.client.settings = settings
+        self.body = json.dumps(deepseek_payload()).encode()
+        text = await self.client.query("兼容")
+        self.assertIn("DeepSeek 自动 当前余额", text)
+        self.assertIn("总余额：CNY 100.01", text)
+        self.assertEqual(self.requests[-1]["path"], "/user/balance")
+        self.assertEqual(
+            self.requests[-1]["headers"]["Authorization"], "Bearer derived-deepseek-key",
+        )
+
+    async def test_derived_openrouter_and_command_code_amounts(self):
+        cases = (
+            (
+                "https://openrouter.ai/api/v1",
+                '{"data":{"total_credits":20,"total_usage":3.5}}',
+                "OpenRouter API Key",
+                "USD 16.50",
+                "/api/v1/credits",
+            ),
+            (
+                "https://api.commandcode.ai/v1",
+                '{"credits":{"monthlyCredits":41.2,"purchasedCredits":5,"freeCredits":0}}',
+                "Command Code API Key",
+                "USD 46.20",
+                "/alpha/billing/credits",
+            ),
+        )
+        for base_url, body, name, amount, path in cases:
+            with self.subTest(base_url=base_url):
+                config = balance_config()
+                config["compatible_balance"] = {
+                    "enabled": True,
+                    "name": name,
+                    "base_url": base_url,
+                    "api_key": "derived-api-key",
+                }
+                settings = BalanceSettings.from_config(config)
+                settings = dataclasses.replace(
+                    settings,
+                    compatible=dataclasses.replace(
+                        settings.compatible, url=self.base + path,
+                    ),
+                )
+                self.client.settings = settings
+                self.body = body.encode()
+                text = await self.client.query("兼容")
+                self.assertIn(amount, text)
+                self.assertEqual(self.requests[-1]["path"], path)
+                self.assertEqual(
+                    self.requests[-1]["headers"]["Authorization"],
+                    "Bearer derived-api-key",
+                )
+
+    async def test_derived_ollama_and_aihubmix_amounts(self):
+        cases = (
+            (
+                "https://ollama.com/v1",
+                '{"purchased":{"balance_usd":25.0}}',
+                "Ollama",
+                "USD 25.00",
+                "/api/balance",
+            ),
+            (
+                "https://aihubmix.com/v1",
+                '{"object":"list","total_usage":12.5}',
+                "AiHubMix",
+                "USD 12.50",
+                "/dashboard/billing/remain",
+            ),
+        )
+        for base_url, body, name, amount, path in cases:
+            with self.subTest(base_url=base_url):
+                config = balance_config()
+                config["compatible_balance"] = {
+                    "enabled": True,
+                    "name": name,
+                    "base_url": base_url,
+                    "api_key": "derived-api-key",
+                }
+                settings = BalanceSettings.from_config(config)
+                settings = dataclasses.replace(
+                    settings,
+                    compatible=dataclasses.replace(
+                        settings.compatible, url=self.base + path,
+                    ),
+                )
+                self.client.settings = settings
+                self.body = body.encode()
+                text = await self.client.query("兼容")
+                self.assertIn(amount, text)
+                self.assertEqual(self.requests[-1]["path"], path)
 
     async def test_missing_configuration_and_invalid_arguments_never_request(self):
         client = BalanceClient(BalanceSettings.from_config({}))
