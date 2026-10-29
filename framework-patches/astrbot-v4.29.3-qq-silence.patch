@@ -1,0 +1,198 @@
+diff --git a/astrbot/core/utils/group_send_guard.py b/astrbot/core/utils/group_send_guard.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..34ea32552f3282981b7ecafb869c2c373ca87556
+--- /dev/null
++++ b/astrbot/core/utils/group_send_guard.py
+@@ -0,0 +1,131 @@
++from __future__ import annotations
++
++import asyncio
++from collections.abc import Awaitable, Callable
++from contextlib import asynccontextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass
++from typing import Any
++from weakref import WeakValueDictionary
++
++API_VERSION = 1
++SUPPORTED_PLATFORMS = frozenset({"qq_official"})
++
++Permission = Callable[[str, str, Any], bool]
++_registrations: set[Registration] = set()
++_locks: WeakValueDictionary[tuple[str, str], asyncio.Lock] = WeakValueDictionary()
++
++
++class GroupSendBlocked(Exception):
++    pass
++
++
++class Registration:
++    def __init__(self, callback: Permission):
++        self.callback = callback
++        self.closed = False
++
++    def close(self) -> None:
++        self.closed = True
++        _registrations.discard(self)
++
++
++@dataclass
++class _Control:
++    registration: Registration
++    scope: tuple[str, str]
++    owner: asyncio.Task
++    message_key: object | None = None
++    used: bool = False
++
++
++_control: ContextVar[_Control | None] = ContextVar("group_send_control", default=None)
++
++
++def register(callback: Permission) -> Registration:
++    if not callable(callback):
++        raise TypeError("A group send permission callback is required")
++    registration = Registration(callback)
++    _registrations.add(registration)
++    return registration
++
++
++def _lock(scope: tuple[str, str]) -> asyncio.Lock:
++    lock = _locks.get(scope)
++    if lock is None:
++        lock = asyncio.Lock()
++        _locks[scope] = lock
++    return lock
++
++
++@asynccontextmanager
++async def control_message(
++    registration: Registration,
++    platform_id: str,
++    group_openid: str,
++    timeout: float = 5.0,
++):
++    owner = asyncio.current_task()
++    current = _control.get()
++    if registration.closed or registration not in _registrations:
++        raise RuntimeError("The group send guard is not registered")
++    if owner is None or (current is not None and current.owner is owner):
++        raise RuntimeError("Nested group control messages are not supported")
++    if timeout <= 0:
++        raise ValueError("A positive group control timeout is required")
++    scope = (str(platform_id), str(group_openid))
++    async with asyncio.timeout(timeout):
++        async with _lock(scope):
++            token = _control.set(_Control(registration, scope, owner))
++            try:
++                yield
++            finally:
++                _control.reset(token)
++
++
++async def send(
++    platform_id: str,
++    group_openid: str,
++    sender: Callable[[], Awaitable[Any]],
++    *,
++    event=None,
++    message_key: object | None = None,
++):
++    scope = (str(platform_id), str(group_openid))
++    control = _control.get()
++    owns_control = (
++        control is not None
++        and control.owner is asyncio.current_task()
++        and control.scope == scope
++    )
++
++    async def deliver():
++        bypass = None
++        if (
++            owns_control
++            and not control.used
++            and not control.registration.closed
++            and control.registration in _registrations
++        ):
++            if control.message_key is None:
++                control.message_key = message_key if message_key is not None else sender
++            if control.message_key is (message_key if message_key is not None else sender):
++                bypass = control.registration
++        for registration in tuple(_registrations):
++            if registration is bypass:
++                continue
++            try:
++                allowed = registration.callback(scope[0], scope[1], event)
++            except Exception as error:
++                raise GroupSendBlocked("Group send permission check failed") from error
++            if allowed is not True:
++                raise GroupSendBlocked("Group output is temporarily blocked")
++        result = await sender()
++        if bypass is not None:
++            control.used = True
++        return result
++
++    if owns_control:
++        return await deliver()
++    async with _lock(scope):
++        return await deliver()
+diff --git a/astrbot/core/platform/sources/qqofficial/qqofficial_message_event.py b/astrbot/core/platform/sources/qqofficial/qqofficial_message_event.py
+index 274932d09e0aaeac172f35e9adbd540aaac4efaa..302f830b875f2a17659cd70218f329da60689ced 100644
+--- a/astrbot/core/platform/sources/qqofficial/qqofficial_message_event.py
++++ b/astrbot/core/platform/sources/qqofficial/qqofficial_message_event.py
+@@ -33,6 +33,7 @@
+     QQOFFICIAL_CHUNKED_UPLOAD_THRESHOLD,
+     QQOfficialChunkedUploader,
+ )
++from astrbot.core.utils import group_send_guard
+ from astrbot.core.utils.media_utils import MediaResolver, file_uri_to_path, is_file_uri
+ 
+ 
+@@ -555,9 +556,15 @@
+                         payload.pop("markdown", None)
+                         payload["content"] = plain_text or None
+                 ret = await self._send_with_markdown_fallback(
+-                    send_func=lambda retry_payload: self.bot.api.post_group_message(
+-                        group_openid=source.group_openid,  # type: ignore
+-                        **retry_payload,
++                    send_func=lambda retry_payload: group_send_guard.send(
++                        self.get_platform_id(),
++                        source.group_openid,
++                        lambda: self.bot.api.post_group_message(
++                            group_openid=source.group_openid,  # type: ignore
++                            **retry_payload,
++                        ),
++                        event=self,
++                        message_key=message_to_send,
+                     ),
+                     payload=payload,
+                     plain_text=plain_text,
+diff --git a/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py b/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py
+index 46cd25366af7e5d135b79a59fe8a1d2300aac71d..215c1d4125b4d996c1fbb21429eb70f91e0c8733 100644
+--- a/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py
++++ b/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py
+@@ -29,6 +29,7 @@
+ )
+ from astrbot.core.message.components import BaseMessageComponent
+ from astrbot.core.platform.astr_message_event import MessageSesion
++from astrbot.core.utils import group_send_guard
+ from astrbot.core.utils.media_utils import MediaResolver
+ 
+ from ...register import register_platform_adapter
+@@ -466,9 +467,14 @@
+                         payload["content"] = plain_text or None
+                         payload.pop("msg_id", None)
+                 ret = await QQOfficialMessageEvent._send_with_markdown_fallback(
+-                    send_func=lambda retry_payload: self.client.api.post_group_message(
+-                        group_openid=session.session_id,
+-                        **retry_payload,
++                    send_func=lambda retry_payload: group_send_guard.send(
++                        self.meta().id,
++                        session.session_id,
++                        lambda: self.client.api.post_group_message(
++                            group_openid=session.session_id,
++                            **retry_payload,
++                        ),
++                        message_key=message_chain,
+                     ),
+                     payload=payload,
+                     plain_text=plain_text,

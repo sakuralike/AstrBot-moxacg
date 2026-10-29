@@ -37,7 +37,36 @@
     "type": "list",
     "description": "允许的群范围",
     "default": [],
-    "hint": "网站联动和余额查询共用。每项为 平台实例ID|机器人自身ID|群ID。空列表关闭全部群，不支持通配符。"
+    "hint": "网站联动、模型查询和群聊沉默共用。每项为 平台实例ID|机器人自身ID|群ID。空列表关闭全部群，不支持通配符。"
+  },
+  "silence_enabled": {
+    "type": "bool",
+    "description": "启用群聊投票沉默",
+    "default": false,
+    "hint": "允许群内发送 /闭嘴 秒数，120 秒内 5 名不同成员同意后生效，时长 1–3600 秒。独立于网站联动开关，保存后重载。完整拦截流式及其他插件主动消息需要框架发送支持；QQ 超过被动回复窗口后的开场白需要主动消息权限。"
+  },
+  "silence_vote_replies": {
+    "type": "list",
+    "description": "投票时随机情绪回复",
+    "default": [
+      "我只是想多陪你们聊两句嘛。",
+      "这票我记在小本本上了。",
+      "好吧，我先把话咽回去。",
+      "哼，又多一个嫌我话多的。"
+    ],
+    "hint": "每名新增投票者随机选择一句，自动追加人数和秒数。每句最多 80 字，空列表使用默认文案。"
+  },
+  "silence_start_text": {
+    "type": "string",
+    "description": "达标后的最后一句",
+    "default": "好吧，我安静 {seconds} 秒，你们聊。",
+    "hint": "最多 200 字，{seconds} 替换为本轮秒数；与第 5 票情绪及人数提示合并发送。"
+  },
+  "silence_end_text": {
+    "type": "string",
+    "description": "恢复后的开场白",
+    "default": "我回来了，刚才的话题继续吧。",
+    "hint": "最多 200 字，可使用 {seconds}。到期恢复响应并尝试发送，发送失败不会延长沉默。"
   },
   "balance_enabled": {
     "type": "bool",

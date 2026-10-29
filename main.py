@@ -1,19 +1,28 @@
+import asyncio
 import hashlib
 import json
 import re
 import time
 import unicodedata
+import weakref
 from collections.abc import Mapping
+from dataclasses import replace
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.star import Context, Star
+
+try:
+    from astrbot.core.utils import group_send_guard as _group_send_guard
+except ImportError:
+    _group_send_guard = None
 
 from .balance import BalanceClient, BalanceSettings
 from .client import BridgeClient, BridgeError, Settings
 from .commands import Actor, CommandMatch, valid_identity
 from .service import ERROR_MESSAGES, binding_event_identity, execute
+from .silence import SilenceManager, SilenceSettings, SilenceTarget
 from .usage import (
     ERROR_MESSAGES as USAGE_ERROR_MESSAGES,
     TokenUsageClient,
@@ -453,6 +462,26 @@ class ScopedCommandFilter(filter.CustomFilter):
         return self.match(event) is not None
 
 
+class ScopedSilenceFilter(filter.CustomFilter):
+    plugin = None
+
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        plugin = type(self).plugin
+        if plugin is None:
+            return False
+        scope = plugin._silence_scope(event)
+        if scope is None:
+            return False
+        if plugin._silence_block(event):
+            return True
+        plugin._silence_events.setdefault(scope, weakref.WeakSet()).add(event)
+        return (
+            plugin._silence_command(event)[0]
+            or getattr(event, "is_wake", False)
+            or event.is_at_or_wake_command
+        )
+
+
 class ZibllPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -462,12 +491,22 @@ class ZibllPlugin(Star):
         self.balance_client = None
         self.usage_settings = None
         self.usage_client = None
+        self.silence_settings = None
+        self.silence_manager = None
+        self._silence_events = {}
+        self._silence_replies = {}
+        self._silence_routes = {}
+        self._silence_registration = None
+        self._silence_init_started = False
+        self._silence_requested = config.get("silence_enabled", False) is True
         self.connected = False
         self._terminated = False
         self._balance_inflight = False
         self._balance_cooldown_until = 0.0
         self._usage_inflight = False
         self._usage_cooldown_until = 0.0
+        self._blindbox_refresh_after = 0.0
+        self._blindbox_refresh_lock = asyncio.Lock()
         self._cooldowns = {}
         self._processed = {}
         self._inflight = set()
@@ -479,6 +518,21 @@ class ZibllPlugin(Star):
         ScopedCommandFilter.blindbox_ready = False
         ScopedBalanceFilter.settings = None
         ScopedUsageFilter.settings = None
+        ScopedSilenceFilter.plugin = self
+        if config.get("silence_enabled", False) is True:
+            try:
+                silence_settings = SilenceSettings.from_config(config)
+            except ValueError:
+                logger.error("群聊沉默配置无效，请检查允许群和回复文案。")
+            else:
+                if silence_settings.scopes:
+                    self.silence_settings = silence_settings
+                    self.silence_manager = SilenceManager(
+                        silence_settings, self._silence_load, self._silence_save,
+                        self._silence_resume,
+                    )
+                else:
+                    logger.warning("群聊沉默未配置允许群，功能保持关闭。")
         if config.get("balance_enabled", False) is True:
             try:
                 balance_settings = BalanceSettings.from_config(config)
@@ -520,6 +574,8 @@ class ZibllPlugin(Star):
 
     async def initialize(self):
         self.connected = False
+        if not self._terminated:
+            await self._silence_initialize()
         if ScopedCommandFilter.settings is self.settings:
             ScopedCommandFilter.code_ready = False
             ScopedCommandFilter.points_ready = False
@@ -538,8 +594,283 @@ class ZibllPlugin(Star):
             ScopedCommandFilter.blindbox_ready = self.client.blindbox_available
             logger.info("AstrBot-Zibll 认证连通验证通过。")
 
+    async def _silence_load(self):
+        return await self.get_kv_data("group_silence", None)
+
+    async def _silence_save(self, snapshot):
+        await self.put_kv_data("group_silence", snapshot)
+
+    @filter.on_astrbot_loaded()
+    async def silence_platform_ready(self):
+        if self._silence_requested:
+            await self._silence_initialize()
+
+    async def _silence_initialize(self):
+        if self._terminated or self._silence_init_started:
+            return
+        if not self._silence_requested:
+            try:
+                await asyncio.wait_for(self.delete_kv_data("group_silence"), 2)
+            except Exception:
+                logger.warning("清理已关闭的群聊沉默状态失败。")
+            return
+        if self.silence_manager is None:
+            return
+        if (
+            _group_send_guard is None
+            or getattr(_group_send_guard, "API_VERSION", None) != 1
+        ):
+            logger.warning(
+                "群聊沉默未启用：当前 AstrBot 缺少 QQ 群发送拦截支持，"
+                "请先安装对应 v4.29.3 框架补丁。"
+            )
+            return
+        for platform_id, _, group_id in self.silence_settings.scopes:
+            platform = self.context.get_platform_inst(platform_id)
+            if (
+                platform is None or platform.meta().name != "qq_official"
+                or platform.meta().name not in _group_send_guard.SUPPORTED_PLATFORMS
+            ):
+                continue
+            bot_id = str(getattr(platform, "appid", ""))
+            if valid_identity(bot_id):
+                self._silence_routes[(platform_id, group_id)] = (
+                    platform_id, bot_id, group_id,
+                )
+        if not self._silence_routes:
+            logger.warning("群聊沉默未找到受支持的 QQ 群平台，功能保持关闭。")
+            return
+        self.silence_manager.settings = replace(
+            self.silence_settings,
+            scopes=frozenset(self._silence_routes.values()),
+        )
+        self._silence_init_started = True
+        registration = _group_send_guard.register(self._silence_allow_send)
+        self._silence_registration = registration
+        ready = await self.silence_manager.initialize()
+        if not ready or self._terminated:
+            registration.close()
+            if self._silence_registration is registration:
+                self._silence_registration = None
+            if not self._terminated:
+                logger.warning("群聊沉默状态恢复失败，本次加载保持关闭。")
+
+    def _silence_allow_send(self, platform_id, group_id, event):
+        if self._terminated or self.silence_manager is None:
+            return True
+        scope = self._silence_routes.get((platform_id, group_id))
+        if scope is None or not self.silence_manager.ready:
+            return True
+        if event is not None and event.get_extra("zibll_silence_discarded", False):
+            return False
+        return not self.silence_manager.is_muted(scope)
+
+    def _silence_scope(self, event):
+        if (
+            self._terminated or self.silence_manager is None
+            or not self.silence_manager.ready
+            or not filter.EventMessageTypeFilter(
+                filter.EventMessageType.GROUP_MESSAGE
+            ).filter(event, {})
+        ):
+            return None
+        try:
+            scope = (
+                event.get_platform_id(), event.get_self_id(), event.get_group_id(),
+            )
+            if not all(valid_identity(value) for value in scope):
+                return None
+            allowed = scope in self.silence_settings.scopes
+            if event.get_platform_name() == "qq_official":
+                allowed = allowed or (
+                    scope[0], "qq_official", scope[2]
+                ) in self.silence_settings.scopes
+            canonical = self._silence_routes.get((scope[0], scope[2]))
+            return canonical if allowed else None
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _silence_discard(event):
+        event.set_extra("zibll_silence_discarded", True)
+        event.clear_result()
+        event.stop_event()
+
+    def _silence_block(self, event):
+        scope = self._silence_scope(event)
+        if scope is None:
+            return False
+        if (
+            event.get_extra("zibll_silence_discarded", False)
+            or self.silence_manager.is_muted(scope)
+        ):
+            self._silence_discard(event)
+            return True
+        return False
+
+    def _silence_command(self, event):
+        if not event.is_at_or_wake_command:
+            return False, None
+        messages = event.get_messages()
+        if not isinstance(messages, (list, tuple)):
+            return False, None
+        text = []
+        self_id = event.get_self_id()
+        for component in messages:
+            if isinstance(component, Plain) and isinstance(component.text, str):
+                raw_text = re.sub(
+                    r'<qqbot-at-user\s+id=["\']([^"\']+)["\']\s*/>',
+                    r"<@\1>", component.text,
+                )
+                cleaned, mentions = _clean_plain_mentions(raw_text)
+                if any(value != self_id for value in mentions):
+                    return False, None
+                text.append(cleaned)
+            elif isinstance(component, At) and str(component.qq) == self_id:
+                text.append(" ")
+            else:
+                return False, None
+        if any(value != self_id for value in _raw_mention_ids(event)):
+            return False, None
+        value = "".join(text).strip()
+        parts = value.split(maxsplit=1)
+        if not parts or parts[0] != "/闭嘴":
+            return False, None
+        if len(value) > 512 or any(
+            unicodedata.category(c).startswith("C") and c != "\t" for c in value
+        ):
+            return True, None
+        argument = parts[1].strip() if len(parts) == 2 else ""
+        if not re.fullmatch(r"[0-9]{1,4}", argument):
+            return True, None
+        return True, int(argument)
+
+    @filter.custom_filter(ScopedSilenceFilter, priority=1000)
+    async def silence_guard(self, event: AstrMessageEvent):
+        scope = self._silence_scope(event)
+        if scope is None or self._silence_block(event):
+            return
+        self._silence_events.setdefault(scope, weakref.WeakSet()).add(event)
+        matched, seconds = self._silence_command(event)
+        if not matched:
+            return
+        sender_id = event.get_sender_id()
+        message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+        event.clear_result()
+        event.stop_event()
+        if (
+            not valid_identity(sender_id) or sender_id == event.get_self_id()
+            or not isinstance(message_id, (str, int)) or isinstance(message_id, bool)
+            or not str(message_id).strip()
+        ):
+            return
+        target = SilenceTarget(
+            scope, event.get_platform_name(),
+            f"{scope[0]}:GroupMessage:{scope[2]}",
+        )
+
+        async def reply(text):
+            if not self._terminated:
+                async with _group_send_guard.control_message(
+                    self._silence_registration, scope[0], scope[2], timeout=5,
+                ):
+                    await event.send(event.plain_result(text).use_markdown(False))
+
+        async def on_enter():
+            self._silence_replies[scope] = (event, time.time())
+            await self._silence_stop_active(target, event)
+
+        await self.silence_manager.vote(
+            target, sender_id, str(message_id), seconds, reply, on_enter,
+        )
+
+    async def _silence_stop_active(self, target, current):
+        events = set(self._silence_events.get(target.scope, ()))
+        origins = set()
+        registry = None
+        try:
+            from astrbot.core.utils.active_event_registry import active_event_registry
+            registry = active_event_registry
+            for registered in registry._events.values():
+                events.update(registered)
+            for tasks in registry._background_tasks.values():
+                events.update(event for task, event in tasks.items() if not task.done())
+        except (ImportError, AttributeError, TypeError):
+            logger.warning("群聊沉默无法读取活动 Agent，请检查 AstrBot 版本。")
+        for event in events:
+            if self._silence_scope(event) != target.scope:
+                continue
+            if event is current:
+                continue
+            self._silence_discard(event)
+            origin = getattr(event, "unified_msg_origin", None)
+            if origin:
+                origins.add(origin)
+        if registry is not None:
+            for origin in origins:
+                try:
+                    registry.stop_all(origin, exclude=current)
+                except Exception:
+                    logger.warning("群聊沉默取消活动 Agent 失败。")
+
+    @filter.on_llm_request(priority=1000)
+    async def silence_llm_guard(self, event: AstrMessageEvent, req):
+        if not self._silence_block(event):
+            scope = self._silence_scope(event)
+            if scope is not None:
+                self._silence_events.setdefault(scope, weakref.WeakSet()).add(event)
+
+    async def _silence_resume(self, target, text):
+        if self._terminated:
+            return
+        async with _group_send_guard.control_message(
+            self._silence_registration, target.scope[0], target.scope[2], timeout=5,
+        ):
+            await self._silence_send_resume(target, text)
+
+    async def _silence_send_resume(self, target, text):
+        saved = self._silence_replies.pop(target.scope, None)
+        if saved is not None:
+            event, received_at = saved
+            stamp = getattr(getattr(event, "message_obj", None), "timestamp", None)
+            if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+                received_at = min(received_at, stamp)
+            if target.platform_name != "qq_official" or time.time() - received_at < 290:
+                await event.send(event.plain_result(text).use_markdown(False))
+                return
+        if target.platform_name == "qq_official":
+            platform = self.context.get_platform_inst(target.scope[0])
+            if platform is None or not getattr(platform, "_allow_group_proactive_send", False):
+                raise RuntimeError("qq_proactive_send_unavailable")
+            platform.remember_session_scene(target.scope[2], "group")
+        sent = await self.context.send_message(
+            target.origin, MessageChain().message(text).use_markdown(False),
+        )
+        if sent is False:
+            raise RuntimeError("silence_platform_unavailable")
+
+    async def _refresh_blindbox_capabilities(self):
+        async with self._blindbox_refresh_lock:
+            if (
+                self._terminated or ScopedCommandFilter.settings is not self.settings
+                or self.client.blindbox_available
+                or time.monotonic() < self._blindbox_refresh_after
+            ):
+                return
+            self._blindbox_refresh_after = time.monotonic() + 30
+            try:
+                await self.client.capabilities()
+            except BridgeError as error:
+                logger.warning("AstrBot-Zibll 盲盒能力刷新失败：%s", error.code)
+            if not self._terminated and ScopedCommandFilter.settings is self.settings:
+                ScopedCommandFilter.code_ready = self.client.binding_code_available
+                ScopedCommandFilter.points_ready = self.client.points_management_available
+                ScopedCommandFilter.blindbox_ready = self.client.blindbox_available
+
     @filter.custom_filter(ScopedBalanceFilter, priority=100)
     async def balance_command(self, event: AstrMessageEvent):
+        if self._silence_block(event):
+            return
         if (
             self._terminated or self.balance_client is None
             or ScopedBalanceFilter.settings is not self.balance_settings
@@ -580,6 +911,8 @@ class ZibllPlugin(Star):
 
     @filter.custom_filter(ScopedUsageFilter, priority=100)
     async def usage_command(self, event: AstrMessageEvent):
+        if self._silence_block(event):
+            return
         if (
             self._terminated or self.usage_client is None
             or ScopedUsageFilter.settings is not self.usage_settings
@@ -622,6 +955,8 @@ class ZibllPlugin(Star):
 
     @filter.custom_filter(ScopedCommandFilter, priority=100)
     async def website_command(self, event: AstrMessageEvent):
+        if self._silence_block(event):
+            return
         if self._terminated or ScopedCommandFilter.settings is not self.settings:
             return
         match = ScopedCommandFilter.match(event)
@@ -665,8 +1000,14 @@ class ZibllPlugin(Star):
             ).use_markdown(False).stop_event()
             return
         if match.action in BLINDBOX_ACTIONS and not self.client.blindbox_available:
-            yield event.plain_result(BLINDBOX_UNAVAILABLE).use_markdown(False).stop_event()
-            return
+            await self._refresh_blindbox_capabilities()
+            if self._terminated or ScopedCommandFilter.settings is not self.settings:
+                return
+            if self._silence_block(event):
+                return
+            if not self.client.blindbox_available:
+                yield event.plain_result(BLINDBOX_UNAVAILABLE).use_markdown(False).stop_event()
+                return
         if match.action in POINT_ACTIONS:
             actor = event_actor(event, self.settings)
             if actor.sender_id not in self.settings.points_operator_ids:
@@ -741,6 +1082,8 @@ class ZibllPlugin(Star):
 
     @filter.on_decorating_result()
     async def qq_pc_compatible_reply(self, event: AstrMessageEvent):
+        if self._silence_block(event):
+            return
         if self._terminated or event.get_platform_name() != "qq_official":
             return
         result = event.get_result()
@@ -751,6 +1094,15 @@ class ZibllPlugin(Star):
 
     async def terminate(self):
         self._terminated = True
+        if ScopedSilenceFilter.plugin is self:
+            ScopedSilenceFilter.plugin = None
+        if self.silence_manager is not None:
+            await self.silence_manager.close()
+        if self._silence_registration is not None:
+            self._silence_registration.close()
+            self._silence_registration = None
+        self._silence_events.clear()
+        self._silence_replies.clear()
         if ScopedBalanceFilter.settings is self.balance_settings:
             ScopedBalanceFilter.settings = None
         if ScopedUsageFilter.settings is self.usage_settings:
